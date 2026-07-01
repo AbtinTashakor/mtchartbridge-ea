@@ -1,0 +1,11 @@
+{
+  "protocol": "mtchartbridge.local-folder.v1",
+  "id": "cmd_20260701_000001",
+  "created_at": "2026-07-01T09:00:01Z",
+  "status": "accepted",
+  "dry_run": true,
+  "symbol": "EURUSD",
+  "action": "BUY",
+  "calculated_volume": 0.01,
+  "message": "Command validated in dry-run mode."
+}

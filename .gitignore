@@ -1,0 +1,15 @@
+*.ex5
+*.log
+logs/
+status.json
+.mtchartbridge-folder
+inbox/
+processing/
+outbox/
+processed/
+failed/
+*.tmp
+*.ready
+.DS_Store
+Thumbs.db
+.vscode/

@@ -1,0 +1,18 @@
+{
+  "protocol": "mtchartbridge.local-folder.v1",
+  "id": "sample_sell_dry_run_001",
+  "created_at": "2026-07-01T09:00:00Z",
+  "action": "SELL",
+  "symbol": "EURUSD",
+  "dry_run": true,
+  "risk": {
+    "mode": "fixed_lot",
+    "fixed_lot": 0.01
+  },
+  "order": {
+    "type": "market",
+    "stop_loss_price": 1.0800,
+    "take_profit_price": 1.0700,
+    "comment": "Sample SELL dry run"
+  }
+}
