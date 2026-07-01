@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //| MTChartBridgeEA.mq5                                              |
-//| Phase 1: local shared-folder transport foundation only.           |
+//| Phase 2: local command intake and response outbox.                |
 //+------------------------------------------------------------------+
 #property copyright "MTChartBridge"
 #property link      ""
@@ -17,11 +17,17 @@ input int    MagicNumber       = 20260701;
 const string ROOT_FOLDER        = "MTChartBridge";
 const string MARKER_FILE_PATH   = "MTChartBridge\\.mtchartbridge-folder";
 const string STATUS_FILE_PATH   = "MTChartBridge\\status.json";
+const string INBOX_FOLDER       = "MTChartBridge\\inbox";
+const string OUTBOX_FOLDER      = "MTChartBridge\\outbox";
+const string PROCESSED_FOLDER   = "MTChartBridge\\processed";
+const string FAILED_FOLDER      = "MTChartBridge\\failed";
 const string COMMON_FOLDER_HINT = "Terminal/Common/Files/MTChartBridge";
+const string EA_PHASE           = "phase-2-command-intake";
 
 int      g_polling_interval_ms = 250;
 ulong    g_heartbeat_counter   = 0;
 datetime g_last_error_log_time = 0;
+string   g_processed_command_ids[];
 
 bool CommonFolderAcceptsFile(const string folder_path, int &probe_error);
 
@@ -99,6 +105,117 @@ string JsonString(const string value)
 string LocalTimestamp()
 {
    return TimeToString(TimeLocal(), TIME_DATE | TIME_SECONDS);
+}
+
+void JsonSkipWhitespace(const string json, int &position)
+{
+   const int length = StringLen(json);
+   while(position < length)
+   {
+      const ushort ch = StringGetCharacter(json, position);
+      if(ch != 32 && ch != 9 && ch != 10 && ch != 13)
+         return;
+
+      position++;
+   }
+}
+
+bool JsonFindValueStart(const string json, const string key, int &position)
+{
+   const string needle = "\"" + key + "\"";
+   const int key_position = StringFind(json, needle);
+   if(key_position < 0)
+      return false;
+
+   const int colon_position = StringFind(json, ":", key_position + StringLen(needle));
+   if(colon_position < 0)
+      return false;
+
+   position = colon_position + 1;
+   JsonSkipWhitespace(json, position);
+   return position < StringLen(json);
+}
+
+bool JsonExtractString(const string json, const string key, string &value)
+{
+   int position = 0;
+   if(!JsonFindValueStart(json, key, position))
+      return false;
+
+   const int length = StringLen(json);
+   if(StringGetCharacter(json, position) != 34)
+      return false;
+
+   position++;
+   string result = "";
+   bool escaping = false;
+
+   while(position < length)
+   {
+      const ushort ch = StringGetCharacter(json, position);
+
+      if(escaping)
+      {
+         if(ch == 34)
+            result += "\"";
+         else if(ch == 92)
+            result += "\\";
+         else if(ch == 47)
+            result += "/";
+         else if(ch == 98)
+            result += " ";
+         else if(ch == 102)
+            result += " ";
+         else if(ch == 110)
+            result += "\n";
+         else if(ch == 114)
+            result += "\r";
+         else if(ch == 116)
+            result += "\t";
+         else
+            result += ShortToString(ch);
+
+         escaping = false;
+      }
+      else if(ch == 92)
+      {
+         escaping = true;
+      }
+      else if(ch == 34)
+      {
+         value = result;
+         return true;
+      }
+      else
+      {
+         result += ShortToString(ch);
+      }
+
+      position++;
+   }
+
+   return false;
+}
+
+bool JsonExtractBool(const string json, const string key, bool &value)
+{
+   int position = 0;
+   if(!JsonFindValueStart(json, key, position))
+      return false;
+
+   if(StringSubstr(json, position, 4) == "true")
+   {
+      value = true;
+      return true;
+   }
+
+   if(StringSubstr(json, position, 5) == "false")
+   {
+      value = false;
+      return true;
+   }
+
+   return false;
 }
 
 //+------------------------------------------------------------------+
@@ -217,6 +334,338 @@ bool WriteCommonTextFile(const string file_path, const string content)
    return true;
 }
 
+bool ReadCommonTextFile(const string file_path, string &content)
+{
+   content = "";
+   ResetLastError();
+
+   const int handle = FileOpen(file_path, FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   if(handle == INVALID_HANDLE)
+   {
+      LogLastError("FileOpen(" + file_path + ")");
+      return false;
+   }
+
+   while(!FileIsEnding(handle))
+   {
+      string line = FileReadString(handle);
+      if(content != "")
+         content += "\n";
+      content += line;
+   }
+
+   FileClose(handle);
+   return true;
+}
+
+bool CopyThenDeleteCommonFile(const string source_path, const string destination_path)
+{
+   ResetLastError();
+   if(!FileIsExist(source_path, FILE_COMMON))
+   {
+      LogDebug("Archive skipped because file does not exist: " + source_path);
+      return true;
+   }
+
+   if(FileIsExist(destination_path, FILE_COMMON))
+   {
+      if(!FileDelete(destination_path, FILE_COMMON))
+      {
+         LogLastError("FileDelete(" + destination_path + ")");
+         return false;
+      }
+   }
+
+   ResetLastError();
+   if(!FileCopy(source_path, FILE_COMMON, destination_path, FILE_REWRITE | FILE_COMMON))
+   {
+      LogLastError("FileCopy(" + source_path + " -> " + destination_path + ")");
+      return false;
+   }
+
+   ResetLastError();
+   if(!FileDelete(source_path, FILE_COMMON))
+   {
+      LogLastError("FileDelete(" + source_path + ")");
+      return false;
+   }
+
+   return true;
+}
+
+bool ArchiveCommandFiles(const string command_id, const string destination_folder)
+{
+   const string payload_name = command_id + ".command.json.tmp";
+   const string marker_name = command_id + ".command.ready";
+   const string payload_source = INBOX_FOLDER + "\\" + payload_name;
+   const string marker_source = INBOX_FOLDER + "\\" + marker_name;
+   const string payload_destination = destination_folder + "\\" + payload_name;
+   const string marker_destination = destination_folder + "\\" + marker_name;
+
+   bool archived = true;
+   if(!CopyThenDeleteCommonFile(payload_source, payload_destination))
+      archived = false;
+   if(!CopyThenDeleteCommonFile(marker_source, marker_destination))
+      archived = false;
+
+   if(archived)
+      LogInfo("Command moved to " + destination_folder + ": " + command_id);
+
+   return archived;
+}
+
+bool WriteResponseFiles(const string command_id, const string response_json)
+{
+   const string response_path = OUTBOX_FOLDER + "\\" + command_id + ".response.json.tmp";
+   const string ready_path = OUTBOX_FOLDER + "\\" + command_id + ".response.ready";
+
+   if(FileIsExist(ready_path, FILE_COMMON))
+   {
+      if(!FileDelete(ready_path, FILE_COMMON))
+      {
+         LogLastError("FileDelete(" + ready_path + ")");
+         return false;
+      }
+   }
+
+   if(!WriteCommonTextFile(response_path, response_json))
+      return false;
+
+   if(!WriteCommonTextFile(ready_path, ""))
+      return false;
+
+   LogInfo("Response written: " + response_path + " and " + ready_path);
+   return true;
+}
+
+string BuildAcceptedResponseJson(const string command_id,
+                                 const string symbol,
+                                 const string side,
+                                 const bool dry_run)
+{
+   string json = "{\n";
+   json += "  \"type\": \"trade.response\",\n";
+   json += "  \"id\": " + JsonString(command_id) + ",\n";
+   json += "  \"status\": \"accepted\",\n";
+   json += "  \"code\": \"COMMAND_RECEIVED\",\n";
+   json += "  \"message\": \"Command received by EA. No trade was executed in Phase 2.\",\n";
+   json += "  \"ea_phase\": " + JsonString(EA_PHASE) + ",\n";
+   json += "  \"symbol\": " + JsonString(symbol) + ",\n";
+   json += "  \"side\": " + JsonString(side) + ",\n";
+   json += "  \"dry_run\": " + (dry_run ? "true" : "false") + ",\n";
+   json += "  \"timestamp_local\": " + JsonString(LocalTimestamp()) + "\n";
+   json += "}\n";
+   return json;
+}
+
+string BuildRejectedResponseJson(const string command_id, const string message)
+{
+   string json = "{\n";
+   json += "  \"type\": \"trade.response\",\n";
+   json += "  \"id\": " + JsonString(command_id) + ",\n";
+   json += "  \"status\": \"rejected\",\n";
+   json += "  \"code\": \"INVALID_COMMAND\",\n";
+   json += "  \"message\": " + JsonString(message) + ",\n";
+   json += "  \"ea_phase\": " + JsonString(EA_PHASE) + ",\n";
+   json += "  \"timestamp_local\": " + JsonString(LocalTimestamp()) + "\n";
+   json += "}\n";
+   return json;
+}
+
+bool IsCommandRemembered(const string command_id)
+{
+   for(int i = 0; i < ArraySize(g_processed_command_ids); i++)
+   {
+      if(g_processed_command_ids[i] == command_id)
+         return true;
+   }
+
+   return false;
+}
+
+void RememberCommandId(const string command_id)
+{
+   if(IsCommandRemembered(command_id))
+      return;
+
+   const int current_size = ArraySize(g_processed_command_ids);
+   const int max_cached = 128;
+
+   if(current_size < max_cached)
+   {
+      ArrayResize(g_processed_command_ids, current_size + 1);
+      g_processed_command_ids[current_size] = command_id;
+      return;
+   }
+
+   for(int i = 1; i < max_cached; i++)
+      g_processed_command_ids[i - 1] = g_processed_command_ids[i];
+
+   g_processed_command_ids[max_cached - 1] = command_id;
+}
+
+bool ReadyFileToCommandId(const string ready_file_name, string &command_id)
+{
+   const string suffix = ".command.ready";
+   const int suffix_length = StringLen(suffix);
+   const int name_length = StringLen(ready_file_name);
+
+   if(name_length <= suffix_length)
+      return false;
+
+   if(StringSubstr(ready_file_name, name_length - suffix_length, suffix_length) != suffix)
+      return false;
+
+   command_id = StringSubstr(ready_file_name, 0, name_length - suffix_length);
+   return command_id != "";
+}
+
+void RejectCommand(const string command_id, const string message)
+{
+   LogInfo("Rejecting command " + command_id + ": " + message);
+
+   if(WriteResponseFiles(command_id, BuildRejectedResponseJson(command_id, message)))
+      RememberCommandId(command_id);
+   else
+      LogInfo("Could not write rejected response for command: " + command_id);
+
+   ArchiveCommandFiles(command_id, FAILED_FOLDER);
+}
+
+void ProcessReadyCommand(const string ready_file_name)
+{
+   string command_id = "";
+   if(!ReadyFileToCommandId(ready_file_name, command_id))
+   {
+      LogInfo("Invalid ready filename detected: " + ready_file_name);
+      return;
+   }
+
+   if(IsCommandRemembered(command_id))
+   {
+      LogDebug("Command already processed in this EA session: " + command_id);
+      return;
+   }
+
+   LogInfo("Command ready file detected: " + INBOX_FOLDER + "\\" + ready_file_name);
+
+   const string command_path = INBOX_FOLDER + "\\" + command_id + ".command.json.tmp";
+   string command_json = "";
+   if(!ReadCommonTextFile(command_path, command_json))
+   {
+      RejectCommand(command_id, "Command payload is missing or unreadable.");
+      return;
+   }
+
+   LogInfo("Command file read: " + command_path);
+
+   string type = "";
+   string id = "";
+   string symbol = "";
+   string side = "";
+   bool dry_run = false;
+
+   if(!JsonExtractString(command_json, "type", type))
+   {
+      RejectCommand(command_id, "Command is missing string field: type.");
+      return;
+   }
+
+   if(!JsonExtractString(command_json, "id", id))
+   {
+      RejectCommand(command_id, "Command is missing string field: id.");
+      return;
+   }
+
+   if(!JsonExtractString(command_json, "symbol", symbol))
+   {
+      RejectCommand(command_id, "Command is missing string field: symbol.");
+      return;
+   }
+
+   if(!JsonExtractString(command_json, "side", side))
+   {
+      RejectCommand(command_id, "Command is missing string field: side.");
+      return;
+   }
+
+   if(!JsonExtractBool(command_json, "dry_run", dry_run))
+   {
+      RejectCommand(command_id, "Command is missing boolean field: dry_run.");
+      return;
+   }
+
+   if(type != "trade.open")
+   {
+      RejectCommand(command_id, "Command type must be trade.open.");
+      return;
+   }
+
+   if(id == "")
+   {
+      RejectCommand(command_id, "Command id must not be empty.");
+      return;
+   }
+
+   if(id != command_id)
+   {
+      RejectCommand(command_id, "Command id does not match ready filename.");
+      return;
+   }
+
+   if(symbol == "")
+   {
+      RejectCommand(command_id, "Command symbol must not be empty.");
+      return;
+   }
+
+   if(side == "")
+   {
+      RejectCommand(command_id, "Command side must not be empty.");
+      return;
+   }
+
+   if(!WriteResponseFiles(command_id, BuildAcceptedResponseJson(command_id, symbol, side, dry_run)))
+   {
+      LogInfo("Could not write accepted response for command: " + command_id);
+      return;
+   }
+
+   RememberCommandId(command_id);
+   ArchiveCommandFiles(command_id, PROCESSED_FOLDER);
+}
+
+bool ProcessOneReadyCommand()
+{
+   string ready_file_name = "";
+   const long find_handle = FileFindFirst(INBOX_FOLDER + "\\*.command.ready", ready_file_name, FILE_COMMON);
+   if(find_handle == INVALID_HANDLE)
+   {
+      ResetLastError();
+      return false;
+   }
+
+   bool found_unprocessed = false;
+
+   do
+   {
+      string command_id = "";
+      if(!ReadyFileToCommandId(ready_file_name, command_id))
+         continue;
+
+      if(IsCommandRemembered(command_id))
+         continue;
+
+      ProcessReadyCommand(ready_file_name);
+      found_unprocessed = true;
+      break;
+   }
+   while(FileFindNext(find_handle, ready_file_name));
+
+   FileFindClose(find_handle);
+   return found_unprocessed;
+}
+
 string BuildMarkerJson()
 {
    string json = "{\n";
@@ -277,7 +726,7 @@ int OnInit()
       g_polling_interval_ms = 10;
    }
 
-   LogInfo("Initializing MTChartBridgeEA phase 1.");
+   LogInfo("Initializing MTChartBridgeEA phase 2.");
    LogInfo("Common folder for Chrome Extension access later: " + COMMON_FOLDER_HINT);
 
    if(!EnsureFolderStructure())
@@ -320,8 +769,9 @@ void OnTimer()
 {
    g_heartbeat_counter++;
 
-   // Phase 1 keeps the timer intentionally small: only a heartbeat status
-   // update is written. No inbox processing or trading is performed here.
    if(!WriteStatusFile())
       LogLastErrorThrottled("WriteStatusFile");
+
+   // Phase 2 reads at most one local command per timer tick and never trades.
+   ProcessOneReadyCommand();
 }
