@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //| MTChartBridgeEA.mq5                                              |
-//| Phase 2: local command intake and response outbox.                |
+//| Phase 3: protocol hardening and idempotency foundation.           |
 //+------------------------------------------------------------------+
 #property copyright "MTChartBridge"
 #property link      ""
@@ -11,6 +11,9 @@ input int    PollingIntervalMs = 250;
 input bool   EnableDebugLogs   = true;
 input string ProductName       = "MTChartBridge";
 input int    MagicNumber       = 20260701;
+input bool   EnforceCommandTtl = true;
+input int    MaxCommandTtlMs   = 30000;
+input int    ProcessedCommandCacheSize = 200;
 
 #define MTCB_VERSION "0.1.0"
 
@@ -22,12 +25,45 @@ const string OUTBOX_FOLDER      = "MTChartBridge\\outbox";
 const string PROCESSED_FOLDER   = "MTChartBridge\\processed";
 const string FAILED_FOLDER      = "MTChartBridge\\failed";
 const string COMMON_FOLDER_HINT = "Terminal/Common/Files/MTChartBridge";
-const string EA_PHASE           = "phase-2-command-intake";
+const string EA_PHASE           = "phase-3-protocol-hardening";
 
 int      g_polling_interval_ms = 250;
+int      g_processed_command_cache_size = 200;
 ulong    g_heartbeat_counter   = 0;
 datetime g_last_error_log_time = 0;
-string   g_processed_command_ids[];
+
+struct ProcessedCommandCacheEntry
+{
+   string id;
+   string status;
+   string code;
+};
+
+struct CommandData
+{
+   string type;
+   string id;
+   string created_at;
+   int    ttl_ms;
+   string symbol;
+   string side;
+   double risk_percent;
+   double stop_loss;
+   double take_profit;
+   bool   dry_run;
+   string comment;
+   string client_version;
+   string source;
+   bool   has_take_profit;
+   bool   has_comment;
+   bool   has_client_version;
+   bool   has_source;
+   bool   has_symbol;
+   bool   has_side;
+   bool   has_dry_run;
+};
+
+ProcessedCommandCacheEntry g_processed_command_cache[];
 
 bool CommonFolderAcceptsFile(const string folder_path, int &probe_error);
 
@@ -136,6 +172,132 @@ bool JsonFindValueStart(const string json, const string key, int &position)
    return position < StringLen(json);
 }
 
+bool JsonFieldExists(const string json, const string key)
+{
+   int position = 0;
+   return JsonFindValueStart(json, key, position);
+}
+
+bool IsJsonValueTerminator(const ushort ch)
+{
+   return ch == 44 || ch == 125 || ch == 93 || ch == 32 || ch == 9 || ch == 10 || ch == 13;
+}
+
+bool IsDigitChar(const ushort ch)
+{
+   return ch >= 48 && ch <= 57;
+}
+
+bool JsonExtractRawToken(const string json, const string key, string &token)
+{
+   int position = 0;
+   token = "";
+   if(!JsonFindValueStart(json, key, position))
+      return false;
+
+   const int length = StringLen(json);
+   while(position < length)
+   {
+      const ushort ch = StringGetCharacter(json, position);
+      if(IsJsonValueTerminator(ch))
+         break;
+
+      token += ShortToString(ch);
+      position++;
+   }
+
+   return token != "";
+}
+
+bool IsStrictIntegerToken(const string token)
+{
+   const int length = StringLen(token);
+   if(length <= 0)
+      return false;
+
+   int start = 0;
+   const ushort first = StringGetCharacter(token, 0);
+   if(first == 43 || first == 45)
+   {
+      if(length == 1)
+         return false;
+      start = 1;
+   }
+
+   for(int i = start; i < length; i++)
+   {
+      if(!IsDigitChar(StringGetCharacter(token, i)))
+         return false;
+   }
+
+   return true;
+}
+
+bool IsStrictNumberToken(const string token)
+{
+   const int length = StringLen(token);
+   if(length <= 0)
+      return false;
+
+   bool has_digit = false;
+   bool has_decimal = false;
+   int start = 0;
+
+   const ushort first = StringGetCharacter(token, 0);
+   if(first == 43 || first == 45)
+   {
+      if(length == 1)
+         return false;
+      start = 1;
+   }
+
+   for(int i = start; i < length; i++)
+   {
+      const ushort ch = StringGetCharacter(token, i);
+      if(IsDigitChar(ch))
+      {
+         has_digit = true;
+         continue;
+      }
+
+      if(ch == 46 && !has_decimal)
+      {
+         has_decimal = true;
+         continue;
+      }
+
+      return false;
+   }
+
+   return has_digit;
+}
+
+bool JsonExtractInt(const string json, const string key, int &value)
+{
+   string token = "";
+   if(!JsonExtractRawToken(json, key, token))
+      return false;
+
+   if(!IsStrictIntegerToken(token))
+      return false;
+
+   value = (int)StringToInteger(token);
+   return true;
+}
+
+bool JsonExtractDoubleNumber(const string json, const string key, double &value)
+{
+   string token = "";
+   if(!JsonExtractRawToken(json, key, token))
+      return false;
+
+   if(!IsStrictNumberToken(token))
+      return false;
+
+   value = StringToDouble(token);
+   return true;
+}
+
 bool JsonExtractString(const string json, const string key, string &value)
 {
    int position = 0;
@@ -205,17 +367,90 @@ bool JsonExtractBool(const string json, const string key, bool &value)
 
    if(StringSubstr(json, position, 4) == "true")
    {
+      const int terminator_position = position + 4;
+      if(terminator_position < StringLen(json) && !IsJsonValueTerminator(StringGetCharacter(json, terminator_position)))
+         return false;
+
       value = true;
       return true;
    }
 
    if(StringSubstr(json, position, 5) == "false")
    {
+      const int terminator_position = position + 5;
+      if(terminator_position < StringLen(json) && !IsJsonValueTerminator(StringGetCharacter(json, terminator_position)))
+         return false;
+
       value = false;
       return true;
    }
 
    return false;
+}
+
+string CompactLocalTimestamp()
+{
+   string value = TimeToString(TimeLocal(), TIME_DATE | TIME_SECONDS);
+   StringReplace(value, ".", "");
+   StringReplace(value, ":", "");
+   StringReplace(value, " ", "-");
+   return value;
+}
+
+string BuildTraceId(const string command_id)
+{
+   return "trace-" + command_id + "-" + CompactLocalTimestamp() + "-" + IntegerToString((long)g_heartbeat_counter);
+}
+
+bool ParseIsoUtcSeconds(const string value, datetime &parsed_utc)
+{
+   parsed_utc = 0;
+
+   // The extension emits UTC in YYYY-MM-DDTHH:MM:SS.mmmZ form. MQL5 has no
+   // direct ISO-8601 UTC parser, so this validates the expected UTC shape,
+   // ignores milliseconds, and compares the resulting timestamp to TimeGMT().
+   if(StringLen(value) < 20)
+      return false;
+
+   if(StringGetCharacter(value, 4) != 45 ||
+      StringGetCharacter(value, 7) != 45 ||
+      StringGetCharacter(value, 10) != 84 ||
+      StringGetCharacter(value, 13) != 58 ||
+      StringGetCharacter(value, 16) != 58)
+      return false;
+
+   if(StringGetCharacter(value, StringLen(value) - 1) != 90)
+      return false;
+
+   const string year_text = StringSubstr(value, 0, 4);
+   const string month_text = StringSubstr(value, 5, 2);
+   const string day_text = StringSubstr(value, 8, 2);
+   const string hour_text = StringSubstr(value, 11, 2);
+   const string minute_text = StringSubstr(value, 14, 2);
+   const string second_text = StringSubstr(value, 17, 2);
+
+   if(!IsStrictIntegerToken(year_text) ||
+      !IsStrictIntegerToken(month_text) ||
+      !IsStrictIntegerToken(day_text) ||
+      !IsStrictIntegerToken(hour_text) ||
+      !IsStrictIntegerToken(minute_text) ||
+      !IsStrictIntegerToken(second_text))
+      return false;
+
+   const int month = (int)StringToInteger(month_text);
+   const int day = (int)StringToInteger(day_text);
+   const int hour = (int)StringToInteger(hour_text);
+   const int minute = (int)StringToInteger(minute_text);
+   const int second = (int)StringToInteger(second_text);
+
+   if(month < 1 || month > 12 || day < 1 || day > 31 ||
+      hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59)
+      return false;
+
+   const string mql_time = year_text + "." + month_text + "." + day_text + " " +
+                           hour_text + ":" + minute_text + ":" + second_text;
+   parsed_utc = StringToTime(mql_time);
+   return parsed_utc > 0;
 }
 
 //+------------------------------------------------------------------+
@@ -438,70 +673,118 @@ bool WriteResponseFiles(const string command_id, const string response_json)
    return true;
 }
 
-string BuildAcceptedResponseJson(const string command_id,
-                                 const string symbol,
-                                 const string side,
-                                 const bool dry_run)
+void ResetCommandData(CommandData &command)
 {
-   string json = "{\n";
-   json += "  \"type\": \"trade.response\",\n";
-   json += "  \"id\": " + JsonString(command_id) + ",\n";
-   json += "  \"status\": \"accepted\",\n";
-   json += "  \"code\": \"COMMAND_RECEIVED\",\n";
-   json += "  \"message\": \"Command received by EA. No trade was executed in Phase 2.\",\n";
-   json += "  \"ea_phase\": " + JsonString(EA_PHASE) + ",\n";
-   json += "  \"symbol\": " + JsonString(symbol) + ",\n";
-   json += "  \"side\": " + JsonString(side) + ",\n";
-   json += "  \"dry_run\": " + (dry_run ? "true" : "false") + ",\n";
-   json += "  \"timestamp_local\": " + JsonString(LocalTimestamp()) + "\n";
-   json += "}\n";
-   return json;
+   command.type = "";
+   command.id = "";
+   command.created_at = "";
+   command.ttl_ms = 0;
+   command.symbol = "";
+   command.side = "";
+   command.risk_percent = 0.0;
+   command.stop_loss = 0.0;
+   command.take_profit = 0.0;
+   command.dry_run = false;
+   command.comment = "";
+   command.client_version = "";
+   command.source = "";
+   command.has_take_profit = false;
+   command.has_comment = false;
+   command.has_client_version = false;
+   command.has_source = false;
+   command.has_symbol = false;
+   command.has_side = false;
+   command.has_dry_run = false;
 }
 
-string BuildRejectedResponseJson(const string command_id, const string message)
+string BuildResponseJson(const string command_id,
+                         const string status,
+                         const string code,
+                         const string message,
+                         CommandData &command,
+                         const string received_at_local,
+                         const string processed_at_local)
 {
    string json = "{\n";
    json += "  \"type\": \"trade.response\",\n";
    json += "  \"id\": " + JsonString(command_id) + ",\n";
-   json += "  \"status\": \"rejected\",\n";
-   json += "  \"code\": \"INVALID_COMMAND\",\n";
+   json += "  \"status\": " + JsonString(status) + ",\n";
+   json += "  \"code\": " + JsonString(code) + ",\n";
    json += "  \"message\": " + JsonString(message) + ",\n";
    json += "  \"ea_phase\": " + JsonString(EA_PHASE) + ",\n";
-   json += "  \"timestamp_local\": " + JsonString(LocalTimestamp()) + "\n";
+
+   if(command.has_symbol)
+      json += "  \"symbol\": " + JsonString(command.symbol) + ",\n";
+   if(command.has_side)
+      json += "  \"side\": " + JsonString(command.side) + ",\n";
+   if(command.has_dry_run)
+      json += "  \"dry_run\": " + (command.dry_run ? "true" : "false") + ",\n";
+   if(command.has_source)
+      json += "  \"source\": " + JsonString(command.source) + ",\n";
+   if(command.has_comment)
+      json += "  \"comment\": " + JsonString(command.comment) + ",\n";
+
+   json += "  \"trace_id\": " + JsonString(BuildTraceId(command_id)) + ",\n";
+   json += "  \"timestamp_local\": " + JsonString(processed_at_local) + ",\n";
+   json += "  \"received_at_local\": " + JsonString(received_at_local) + ",\n";
+   json += "  \"processed_at_local\": " + JsonString(processed_at_local) + "\n";
    json += "}\n";
    return json;
 }
 
-bool IsCommandRemembered(const string command_id)
+bool FindProcessedCommand(const string command_id, ProcessedCommandCacheEntry &entry)
 {
-   for(int i = 0; i < ArraySize(g_processed_command_ids); i++)
+   for(int i = 0; i < ArraySize(g_processed_command_cache); i++)
    {
-      if(g_processed_command_ids[i] == command_id)
+      if(g_processed_command_cache[i].id == command_id)
+      {
+         entry = g_processed_command_cache[i];
          return true;
+      }
    }
 
    return false;
 }
 
-void RememberCommandId(const string command_id)
+bool IsCommandRemembered(const string command_id)
 {
-   if(IsCommandRemembered(command_id))
+   ProcessedCommandCacheEntry entry;
+   return FindProcessedCommand(command_id, entry);
+}
+
+void RememberCommandResult(const string command_id, const string status, const string code)
+{
+   if(command_id == "")
       return;
 
-   const int current_size = ArraySize(g_processed_command_ids);
-   const int max_cached = 128;
+   for(int i = 0; i < ArraySize(g_processed_command_cache); i++)
+   {
+      if(g_processed_command_cache[i].id == command_id)
+      {
+         g_processed_command_cache[i].status = status;
+         g_processed_command_cache[i].code = code;
+         return;
+      }
+   }
+
+   const int current_size = ArraySize(g_processed_command_cache);
+   const int max_cached = g_processed_command_cache_size;
 
    if(current_size < max_cached)
    {
-      ArrayResize(g_processed_command_ids, current_size + 1);
-      g_processed_command_ids[current_size] = command_id;
+      ArrayResize(g_processed_command_cache, current_size + 1);
+      g_processed_command_cache[current_size].id = command_id;
+      g_processed_command_cache[current_size].status = status;
+      g_processed_command_cache[current_size].code = code;
       return;
    }
 
    for(int i = 1; i < max_cached; i++)
-      g_processed_command_ids[i - 1] = g_processed_command_ids[i];
+      g_processed_command_cache[i - 1] = g_processed_command_cache[i];
 
-   g_processed_command_ids[max_cached - 1] = command_id;
+   g_processed_command_cache[max_cached - 1].id = command_id;
+   g_processed_command_cache[max_cached - 1].status = status;
+   g_processed_command_cache[max_cached - 1].code = code;
 }
 
 bool ReadyFileToCommandId(const string ready_file_name, string &command_id)
@@ -520,20 +803,287 @@ bool ReadyFileToCommandId(const string ready_file_name, string &command_id)
    return command_id != "";
 }
 
-void RejectCommand(const string command_id, const string message)
+bool FinalizeCommand(const string command_id,
+                     const string status,
+                     const string code,
+                     const string message,
+                     CommandData &command,
+                     const string received_at_local,
+                     const string archive_folder,
+                     const bool remember_result)
 {
-   LogInfo("Rejecting command " + command_id + ": " + message);
+   const string processed_at_local = LocalTimestamp();
+   const string response_json = BuildResponseJson(command_id,
+                                                  status,
+                                                  code,
+                                                  message,
+                                                  command,
+                                                  received_at_local,
+                                                  processed_at_local);
 
-   if(WriteResponseFiles(command_id, BuildRejectedResponseJson(command_id, message)))
-      RememberCommandId(command_id);
-   else
-      LogInfo("Could not write rejected response for command: " + command_id);
+   if(!WriteResponseFiles(command_id, response_json))
+   {
+      LogInfo("RESPONSE_WRITE_FAILED for command: " + command_id);
+      return false;
+   }
 
-   ArchiveCommandFiles(command_id, FAILED_FOLDER);
+   LogDebug("Response written with status=" + status + " code=" + code + " command_id=" + command_id);
+
+   if(remember_result)
+      RememberCommandResult(command_id, status, code);
+
+   if(!ArchiveCommandFiles(command_id, archive_folder))
+   {
+      LogInfo("ARCHIVE_FAILED for command: " + command_id + " destination=" + archive_folder);
+      return false;
+   }
+
+   return true;
+}
+
+bool RejectCommand(const string command_id,
+                   const string code,
+                   const string message,
+                   CommandData &command,
+                   const string received_at_local)
+{
+   LogInfo("Protocol validation rejected command " + command_id + " code=" + code + " message=" + message);
+   return FinalizeCommand(command_id,
+                          "rejected",
+                          code,
+                          message,
+                          command,
+                          received_at_local,
+                          FAILED_FOLDER,
+                          true);
+}
+
+bool ValidateRequiredField(const string command_json,
+                           const string field_name,
+                           const string command_id,
+                           CommandData &command,
+                           const string received_at_local)
+{
+   if(JsonFieldExists(command_json, field_name))
+      return true;
+
+   RejectCommand(command_id,
+                 "MISSING_REQUIRED_FIELD",
+                 "Command is missing required field: " + field_name + ".",
+                 command,
+                 received_at_local);
+   return false;
+}
+
+bool ParseAndValidateCommand(const string command_json,
+                             const string command_id,
+                             CommandData &command,
+                             const string received_at_local)
+{
+   string required_fields[] =
+   {
+      "type",
+      "id",
+      "created_at",
+      "ttl_ms",
+      "symbol",
+      "side",
+      "risk_percent",
+      "stop_loss",
+      "dry_run"
+   };
+
+   for(int i = 0; i < ArraySize(required_fields); i++)
+   {
+      if(!ValidateRequiredField(command_json, required_fields[i], command_id, command, received_at_local))
+         return false;
+   }
+
+   if(!JsonExtractString(command_json, "type", command.type))
+   {
+      RejectCommand(command_id, "INVALID_TYPE", "Command type must be the string trade.open.", command, received_at_local);
+      return false;
+   }
+
+   if(command.type != "trade.open")
+   {
+      RejectCommand(command_id, "INVALID_TYPE", "Command type must equal trade.open.", command, received_at_local);
+      return false;
+   }
+
+   if(!JsonExtractString(command_json, "id", command.id))
+   {
+      RejectCommand(command_id, "MISSING_REQUIRED_FIELD", "Command id must be a string.", command, received_at_local);
+      return false;
+   }
+
+   if(command.id == "")
+   {
+      RejectCommand(command_id, "MISSING_REQUIRED_FIELD", "Command id must not be empty.", command, received_at_local);
+      return false;
+   }
+
+   if(command.id != command_id)
+   {
+      RejectCommand(command_id, "ID_MISMATCH", "Command id does not match command filename.", command, received_at_local);
+      return false;
+   }
+
+   if(!JsonExtractString(command_json, "created_at", command.created_at))
+   {
+      RejectCommand(command_id, "MISSING_REQUIRED_FIELD", "Command created_at must be a string.", command, received_at_local);
+      return false;
+   }
+
+   if(command.created_at == "")
+   {
+      RejectCommand(command_id, "MISSING_REQUIRED_FIELD", "Command created_at must not be empty.", command, received_at_local);
+      return false;
+   }
+
+   if(!JsonExtractInt(command_json, "ttl_ms", command.ttl_ms) ||
+      command.ttl_ms <= 0 ||
+      command.ttl_ms > MaxCommandTtlMs)
+   {
+      RejectCommand(command_id, "INVALID_TTL", "Command ttl_ms must be positive and must not exceed MaxCommandTtlMs.", command, received_at_local);
+      return false;
+   }
+
+   if(!JsonExtractString(command_json, "symbol", command.symbol))
+   {
+      RejectCommand(command_id, "MISSING_REQUIRED_FIELD", "Command symbol must be a string.", command, received_at_local);
+      return false;
+   }
+   command.has_symbol = true;
+
+   if(command.symbol == "")
+   {
+      RejectCommand(command_id, "MISSING_REQUIRED_FIELD", "Command symbol must not be empty.", command, received_at_local);
+      return false;
+   }
+
+   if(!JsonExtractString(command_json, "side", command.side))
+   {
+      RejectCommand(command_id, "INVALID_SIDE", "Command side must be buy or sell.", command, received_at_local);
+      return false;
+   }
+   command.has_side = true;
+
+   if(command.side != "buy" && command.side != "sell")
+   {
+      RejectCommand(command_id, "INVALID_SIDE", "Command side must be buy or sell.", command, received_at_local);
+      return false;
+   }
+
+   if(!JsonExtractDoubleNumber(command_json, "risk_percent", command.risk_percent) ||
+      command.risk_percent <= 0.0)
+   {
+      RejectCommand(command_id, "INVALID_RISK_PERCENT", "Command risk_percent must be positive.", command, received_at_local);
+      return false;
+   }
+
+   if(!JsonExtractDoubleNumber(command_json, "stop_loss", command.stop_loss) ||
+      command.stop_loss == 0.0)
+   {
+      RejectCommand(command_id, "INVALID_STOP_LOSS", "Command stop_loss must be present and non-zero.", command, received_at_local);
+      return false;
+   }
+
+   if(!JsonExtractBool(command_json, "dry_run", command.dry_run))
+   {
+      RejectCommand(command_id, "MISSING_REQUIRED_FIELD", "Command dry_run must be a boolean.", command, received_at_local);
+      return false;
+   }
+   command.has_dry_run = true;
+
+   if(JsonFieldExists(command_json, "take_profit"))
+   {
+      if(!JsonExtractDoubleNumber(command_json, "take_profit", command.take_profit))
+      {
+         RejectCommand(command_id, "INVALID_COMMAND", "Command take_profit must be numeric when present.", command, received_at_local);
+         return false;
+      }
+      command.has_take_profit = true;
+   }
+
+   if(JsonFieldExists(command_json, "comment"))
+   {
+      if(!JsonExtractString(command_json, "comment", command.comment))
+      {
+         RejectCommand(command_id, "INVALID_COMMAND", "Command comment must be a string when present.", command, received_at_local);
+         return false;
+      }
+      command.has_comment = true;
+   }
+
+   if(JsonFieldExists(command_json, "client_version"))
+   {
+      if(!JsonExtractString(command_json, "client_version", command.client_version))
+      {
+         RejectCommand(command_id, "INVALID_COMMAND", "Command client_version must be a string when present.", command, received_at_local);
+         return false;
+      }
+      command.has_client_version = true;
+   }
+
+   if(JsonFieldExists(command_json, "source"))
+   {
+      if(!JsonExtractString(command_json, "source", command.source))
+      {
+         RejectCommand(command_id, "INVALID_COMMAND", "Command source must be a string when present.", command, received_at_local);
+         return false;
+      }
+      command.has_source = true;
+   }
+
+   if(EnforceCommandTtl)
+   {
+      datetime created_utc = 0;
+      if(!ParseIsoUtcSeconds(command.created_at, created_utc))
+      {
+         RejectCommand(command_id, "INVALID_TTL", "Command created_at must use YYYY-MM-DDTHH:MM:SS.mmmZ UTC format.", command, received_at_local);
+         return false;
+      }
+
+      const datetime now_utc = TimeGMT();
+      const long age_seconds = (long)(now_utc - created_utc);
+      const long ttl_seconds = (long)((command.ttl_ms + 999) / 1000);
+
+      if(age_seconds > ttl_seconds)
+      {
+         LogInfo("Expired command detected: " + command_id + " age_seconds=" + IntegerToString(age_seconds) + " ttl_ms=" + IntegerToString(command.ttl_ms));
+         RejectCommand(command_id, "COMMAND_EXPIRED", "Command expired before EA processing.", command, received_at_local);
+         return false;
+      }
+   }
+
+   LogInfo("Protocol validation passed for command: " + command_id);
+   return true;
+}
+
+void ProcessDuplicateCommand(const string command_id, const string received_at_local)
+{
+   ProcessedCommandCacheEntry previous;
+   FindProcessedCommand(command_id, previous);
+
+   CommandData command;
+   ResetCommandData(command);
+
+   LogInfo("Duplicate command detected: " + command_id + " previous_status=" + previous.status + " previous_code=" + previous.code);
+   FinalizeCommand(command_id,
+                   "duplicate",
+                   "DUPLICATE_COMMAND",
+                   "Command was already processed by this EA session.",
+                   command,
+                   received_at_local,
+                   FAILED_FOLDER,
+                   false);
 }
 
 void ProcessReadyCommand(const string ready_file_name)
 {
+   const string received_at_local = LocalTimestamp();
+
    string command_id = "";
    if(!ReadyFileToCommandId(ready_file_name, command_id))
    {
@@ -541,98 +1091,47 @@ void ProcessReadyCommand(const string ready_file_name)
       return;
    }
 
+   LogInfo("Command ready file detected: " + INBOX_FOLDER + "\\" + ready_file_name);
+
    if(IsCommandRemembered(command_id))
    {
-      LogDebug("Command already processed in this EA session: " + command_id);
+      ProcessDuplicateCommand(command_id, received_at_local);
       return;
    }
 
-   LogInfo("Command ready file detected: " + INBOX_FOLDER + "\\" + ready_file_name);
-
    const string command_path = INBOX_FOLDER + "\\" + command_id + ".command.json.tmp";
+   CommandData command;
+   ResetCommandData(command);
+
+   if(!FileIsExist(command_path, FILE_COMMON))
+   {
+      LogInfo("COMMAND_FILE_MISSING for command: " + command_id);
+      RejectCommand(command_id, "COMMAND_FILE_MISSING", "Command payload file is missing.", command, received_at_local);
+      return;
+   }
+
    string command_json = "";
    if(!ReadCommonTextFile(command_path, command_json))
    {
-      RejectCommand(command_id, "Command payload is missing or unreadable.");
+      LogInfo("COMMAND_FILE_READ_FAILED for command: " + command_id);
+      RejectCommand(command_id, "COMMAND_FILE_READ_FAILED", "Command payload could not be read.", command, received_at_local);
       return;
    }
 
    LogInfo("Command file read: " + command_path);
+   LogDebug("Command parsed for protocol validation: " + command_id);
 
-   string type = "";
-   string id = "";
-   string symbol = "";
-   string side = "";
-   bool dry_run = false;
-
-   if(!JsonExtractString(command_json, "type", type))
-   {
-      RejectCommand(command_id, "Command is missing string field: type.");
+   if(!ParseAndValidateCommand(command_json, command_id, command, received_at_local))
       return;
-   }
 
-   if(!JsonExtractString(command_json, "id", id))
-   {
-      RejectCommand(command_id, "Command is missing string field: id.");
-      return;
-   }
-
-   if(!JsonExtractString(command_json, "symbol", symbol))
-   {
-      RejectCommand(command_id, "Command is missing string field: symbol.");
-      return;
-   }
-
-   if(!JsonExtractString(command_json, "side", side))
-   {
-      RejectCommand(command_id, "Command is missing string field: side.");
-      return;
-   }
-
-   if(!JsonExtractBool(command_json, "dry_run", dry_run))
-   {
-      RejectCommand(command_id, "Command is missing boolean field: dry_run.");
-      return;
-   }
-
-   if(type != "trade.open")
-   {
-      RejectCommand(command_id, "Command type must be trade.open.");
-      return;
-   }
-
-   if(id == "")
-   {
-      RejectCommand(command_id, "Command id must not be empty.");
-      return;
-   }
-
-   if(id != command_id)
-   {
-      RejectCommand(command_id, "Command id does not match ready filename.");
-      return;
-   }
-
-   if(symbol == "")
-   {
-      RejectCommand(command_id, "Command symbol must not be empty.");
-      return;
-   }
-
-   if(side == "")
-   {
-      RejectCommand(command_id, "Command side must not be empty.");
-      return;
-   }
-
-   if(!WriteResponseFiles(command_id, BuildAcceptedResponseJson(command_id, symbol, side, dry_run)))
-   {
-      LogInfo("Could not write accepted response for command: " + command_id);
-      return;
-   }
-
-   RememberCommandId(command_id);
-   ArchiveCommandFiles(command_id, PROCESSED_FOLDER);
+   FinalizeCommand(command_id,
+                   "accepted",
+                   "COMMAND_RECEIVED",
+                   "Command received by EA. No trade was executed in Phase 3.",
+                   command,
+                   received_at_local,
+                   PROCESSED_FOLDER,
+                   true);
 }
 
 bool ProcessOneReadyCommand()
@@ -651,9 +1150,6 @@ bool ProcessOneReadyCommand()
    {
       string command_id = "";
       if(!ReadyFileToCommandId(ready_file_name, command_id))
-         continue;
-
-      if(IsCommandRemembered(command_id))
          continue;
 
       ProcessReadyCommand(ready_file_name);
@@ -703,6 +1199,9 @@ string BuildStatusJson()
    json += "  \"chart_period\": " + JsonString(EnumToString((ENUM_TIMEFRAMES)_Period)) + ",\n";
    json += "  \"magic_number\": " + IntegerToString(MagicNumber) + ",\n";
    json += "  \"polling_interval_ms\": " + IntegerToString(g_polling_interval_ms) + ",\n";
+   json += "  \"enforce_command_ttl\": " + (EnforceCommandTtl ? "true" : "false") + ",\n";
+   json += "  \"max_command_ttl_ms\": " + IntegerToString(MaxCommandTtlMs) + ",\n";
+   json += "  \"processed_command_cache_size\": " + IntegerToString(g_processed_command_cache_size) + ",\n";
    json += "  \"timestamp_local\": " + JsonString(LocalTimestamp()) + ",\n";
    json += "  \"heartbeat_counter\": " + IntegerToString((long)g_heartbeat_counter) + "\n";
    json += "}\n";
@@ -726,7 +1225,17 @@ int OnInit()
       g_polling_interval_ms = 10;
    }
 
-   LogInfo("Initializing MTChartBridgeEA phase 2.");
+   g_processed_command_cache_size = ProcessedCommandCacheSize;
+   if(g_processed_command_cache_size < 1)
+   {
+      LogInfo("ProcessedCommandCacheSize was below 1; using 1 instead.");
+      g_processed_command_cache_size = 1;
+   }
+
+   LogInfo("Initializing MTChartBridgeEA phase 3.");
+   LogInfo("Command TTL enforcement=" + (EnforceCommandTtl ? "true" : "false") +
+           " max_ttl_ms=" + IntegerToString(MaxCommandTtlMs) +
+           " processed_cache_size=" + IntegerToString(g_processed_command_cache_size));
    LogInfo("Common folder for Chrome Extension access later: " + COMMON_FOLDER_HINT);
 
    if(!EnsureFolderStructure())
@@ -772,6 +1281,6 @@ void OnTimer()
    if(!WriteStatusFile())
       LogLastErrorThrottled("WriteStatusFile");
 
-   // Phase 2 reads at most one local command per timer tick and never trades.
+   // Phase 3 reads at most one local command per timer tick and never trades.
    ProcessOneReadyCommand();
 }

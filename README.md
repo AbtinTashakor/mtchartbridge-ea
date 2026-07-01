@@ -12,7 +12,7 @@ Chrome Extension <-> Local Shared Folder <-> MT5 Expert Advisor
 
 The Chrome Extension writes command files into a user-selected local folder. The MT5 Expert Advisor reads those local files, validates commands, calculates the final trade volume inside MT5, and writes response files back to the same local workflow.
 
-Current status: **Phase 1 EA Core**.
+Current status: **Phase 3 Protocol Hardening + Idempotency Foundation**.
 
 ## Repository Layout
 

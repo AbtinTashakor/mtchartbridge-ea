@@ -9,5 +9,7 @@
   "stop_loss": 1.08000,
   "take_profit": 1.09000,
   "dry_run": true,
-  "comment": "MTChartBridge"
+  "comment": "MTChartBridge",
+  "client_version": "0.1.0",
+  "source": "chrome-extension"
 }
