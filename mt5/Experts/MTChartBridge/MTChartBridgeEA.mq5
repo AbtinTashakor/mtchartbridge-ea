@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //| MTChartBridgeEA.mq5                                              |
-//| Phase 3: protocol hardening and idempotency foundation.           |
+//| Phase 4: market validation, no risk, no trade.                    |
 //+------------------------------------------------------------------+
 #property copyright "MTChartBridge"
 #property link      ""
@@ -14,6 +14,8 @@ input int    MagicNumber       = 20260701;
 input bool   EnforceCommandTtl = true;
 input int    MaxCommandTtlMs   = 30000;
 input int    ProcessedCommandCacheSize = 200;
+input int    RejectIfSpreadAbovePoints = 0;
+input string AllowedSymbols = "";
 
 #define MTCB_VERSION "0.1.0"
 
@@ -25,7 +27,7 @@ const string OUTBOX_FOLDER      = "MTChartBridge\\outbox";
 const string PROCESSED_FOLDER   = "MTChartBridge\\processed";
 const string FAILED_FOLDER      = "MTChartBridge\\failed";
 const string COMMON_FOLDER_HINT = "Terminal/Common/Files/MTChartBridge";
-const string EA_PHASE           = "phase-3-protocol-hardening";
+const string EA_PHASE           = "phase-4-market-validation";
 
 int      g_polling_interval_ms = 250;
 int      g_processed_command_cache_size = 200;
@@ -61,6 +63,24 @@ struct CommandData
    bool   has_symbol;
    bool   has_side;
    bool   has_dry_run;
+   bool   has_stop_loss;
+   bool   has_market_validation_settings;
+   bool   has_bid;
+   bool   has_ask;
+   bool   has_entry_price_reference;
+   bool   has_spread_points;
+   bool   has_stop_level_points;
+   bool   has_point;
+   bool   has_digits;
+   double bid;
+   double ask;
+   double entry_price_reference;
+   int    spread_points;
+   int    stop_level_points;
+   double point;
+   int    digits;
+   string allowed_symbols;
+   int    reject_if_spread_above_points;
 };
 
 ProcessedCommandCacheEntry g_processed_command_cache[];
@@ -136,6 +156,11 @@ string JsonEscape(const string value)
 string JsonString(const string value)
 {
    return "\"" + JsonEscape(value) + "\"";
+}
+
+string JsonDouble(const double value, const int digits)
+{
+   return DoubleToString(value, digits);
 }
 
 string LocalTimestamp()
@@ -695,6 +720,24 @@ void ResetCommandData(CommandData &command)
    command.has_symbol = false;
    command.has_side = false;
    command.has_dry_run = false;
+   command.has_stop_loss = false;
+   command.has_market_validation_settings = false;
+   command.has_bid = false;
+   command.has_ask = false;
+   command.has_entry_price_reference = false;
+   command.has_spread_points = false;
+   command.has_stop_level_points = false;
+   command.has_point = false;
+   command.has_digits = false;
+   command.bid = 0.0;
+   command.ask = 0.0;
+   command.entry_price_reference = 0.0;
+   command.spread_points = 0;
+   command.stop_level_points = 0;
+   command.point = 0.0;
+   command.digits = 0;
+   command.allowed_symbols = "";
+   command.reject_if_spread_above_points = 0;
 }
 
 string BuildResponseJson(const string command_id,
@@ -723,6 +766,29 @@ string BuildResponseJson(const string command_id,
       json += "  \"source\": " + JsonString(command.source) + ",\n";
    if(command.has_comment)
       json += "  \"comment\": " + JsonString(command.comment) + ",\n";
+   if(command.has_bid)
+      json += "  \"bid\": " + JsonDouble(command.bid, command.has_digits ? command.digits : 8) + ",\n";
+   if(command.has_ask)
+      json += "  \"ask\": " + JsonDouble(command.ask, command.has_digits ? command.digits : 8) + ",\n";
+   if(command.has_entry_price_reference)
+      json += "  \"entry_price_reference\": " + JsonDouble(command.entry_price_reference, command.has_digits ? command.digits : 8) + ",\n";
+   if(command.has_spread_points)
+      json += "  \"spread_points\": " + IntegerToString(command.spread_points) + ",\n";
+   if(command.has_stop_level_points)
+      json += "  \"stop_level_points\": " + IntegerToString(command.stop_level_points) + ",\n";
+   if(command.has_point)
+      json += "  \"point\": " + JsonDouble(command.point, 10) + ",\n";
+   if(command.has_digits)
+      json += "  \"digits\": " + IntegerToString(command.digits) + ",\n";
+   if(command.has_stop_loss)
+      json += "  \"stop_loss\": " + JsonDouble(command.stop_loss, command.has_digits ? command.digits : 8) + ",\n";
+   if(command.has_take_profit)
+      json += "  \"take_profit\": " + JsonDouble(command.take_profit, command.has_digits ? command.digits : 8) + ",\n";
+   if(command.has_market_validation_settings)
+   {
+      json += "  \"allowed_symbols\": " + JsonString(command.allowed_symbols) + ",\n";
+      json += "  \"reject_if_spread_above_points\": " + IntegerToString(command.reject_if_spread_above_points) + ",\n";
+   }
 
    json += "  \"trace_id\": " + JsonString(BuildTraceId(command_id)) + ",\n";
    json += "  \"timestamp_local\": " + JsonString(processed_at_local) + ",\n";
@@ -812,6 +878,12 @@ bool FinalizeCommand(const string command_id,
                      const string archive_folder,
                      const bool remember_result)
 {
+   string final_archive_folder = archive_folder;
+   if(status == "accepted")
+      final_archive_folder = PROCESSED_FOLDER;
+   else if(status == "rejected" || status == "duplicate")
+      final_archive_folder = FAILED_FOLDER;
+
    const string processed_at_local = LocalTimestamp();
    const string response_json = BuildResponseJson(command_id,
                                                   status,
@@ -827,14 +899,17 @@ bool FinalizeCommand(const string command_id,
       return false;
    }
 
-   LogDebug("Response written with status=" + status + " code=" + code + " command_id=" + command_id);
+   LogDebug("Final response status=" + status +
+            " code=" + code +
+            " command_id=" + command_id +
+            " archive_destination=" + final_archive_folder);
 
    if(remember_result)
       RememberCommandResult(command_id, status, code);
 
-   if(!ArchiveCommandFiles(command_id, archive_folder))
+   if(!ArchiveCommandFiles(command_id, final_archive_folder))
    {
-      LogInfo("ARCHIVE_FAILED for command: " + command_id + " destination=" + archive_folder);
+      LogInfo("ARCHIVE_FAILED for command: " + command_id + " destination=" + final_archive_folder);
       return false;
    }
 
@@ -856,6 +931,351 @@ bool RejectCommand(const string command_id,
                           received_at_local,
                           FAILED_FOLDER,
                           true);
+}
+
+bool RejectMarketCommand(const string command_id,
+                         const string code,
+                         const string message,
+                         CommandData &command,
+                         const string received_at_local)
+{
+   LogInfo("Market validation rejected command " + command_id + " code=" + code + " message=" + message);
+   return FinalizeCommand(command_id,
+                          "rejected",
+                          code,
+                          message,
+                          command,
+                          received_at_local,
+                          FAILED_FOLDER,
+                          true);
+}
+
+bool FailMarketValidation(const string command_id,
+                          const string code,
+                          const string message,
+                          CommandData &command,
+                          const string received_at_local)
+{
+   RejectMarketCommand(command_id, code, message, command, received_at_local);
+   return false;
+}
+
+string TrimWhitespace(const string value)
+{
+   int start = 0;
+   int end = StringLen(value) - 1;
+
+   while(start <= end)
+   {
+      const ushort ch = StringGetCharacter(value, start);
+      if(ch != 32 && ch != 9 && ch != 10 && ch != 13)
+         break;
+      start++;
+   }
+
+   while(end >= start)
+   {
+      const ushort ch = StringGetCharacter(value, end);
+      if(ch != 32 && ch != 9 && ch != 10 && ch != 13)
+         break;
+      end--;
+   }
+
+   if(end < start)
+      return "";
+
+   return StringSubstr(value, start, end - start + 1);
+}
+
+string UppercaseCopy(string value)
+{
+   StringToUpper(value);
+   return value;
+}
+
+bool IsSymbolAllowedByInput(const string symbol)
+{
+   const string allowlist = TrimWhitespace(AllowedSymbols);
+   if(allowlist == "")
+      return true;
+
+   string allowed_items[];
+   const ushort comma = StringGetCharacter(",", 0);
+   const int item_count = StringSplit(allowlist, comma, allowed_items);
+   const string normalized_symbol = UppercaseCopy(TrimWhitespace(symbol));
+
+   for(int i = 0; i < item_count; i++)
+   {
+      if(UppercaseCopy(TrimWhitespace(allowed_items[i])) == normalized_symbol)
+         return true;
+   }
+
+   return false;
+}
+
+bool HasActiveTakeProfit(CommandData &command)
+{
+   return command.has_take_profit && command.take_profit != 0.0;
+}
+
+bool ValidateMarketForCommand(const string command_id,
+                              CommandData &command,
+                              const string received_at_local)
+{
+   command.has_market_validation_settings = true;
+   command.allowed_symbols = AllowedSymbols;
+   command.reject_if_spread_above_points = RejectIfSpreadAbovePoints;
+
+   command.symbol = TrimWhitespace(command.symbol);
+
+   if(!IsSymbolAllowedByInput(command.symbol))
+   {
+      LogDebug("Symbol allowlist rejected symbol=" + command.symbol + " allowed_symbols=" + AllowedSymbols);
+      return FailMarketValidation(command_id,
+                                  "SYMBOL_NOT_ALLOWED",
+                                  "Command symbol is not included in AllowedSymbols.",
+                                  command,
+                                  received_at_local);
+   }
+
+   ResetLastError();
+   if((bool)SymbolInfoInteger(command.symbol, SYMBOL_SELECT))
+   {
+      LogDebug("Symbol already selected: " + command.symbol);
+   }
+   else
+   {
+      ResetLastError();
+      if(!SymbolSelect(command.symbol, true))
+      {
+         LogLastError("SymbolSelect(" + command.symbol + ")");
+         return FailMarketValidation(command_id,
+                                     "SYMBOL_SELECT_FAILED",
+                                     "Command symbol could not be selected in Market Watch.",
+                                     command,
+                                     received_at_local);
+      }
+
+      LogInfo("Symbol selected for market validation: " + command.symbol);
+   }
+
+   long digits_raw = 0;
+   if(SymbolInfoInteger(command.symbol, SYMBOL_DIGITS, digits_raw))
+   {
+      command.digits = (int)digits_raw;
+      command.has_digits = true;
+   }
+
+   double bid = 0.0;
+   double ask = 0.0;
+   if(!SymbolInfoDouble(command.symbol, SYMBOL_BID, bid) ||
+      !SymbolInfoDouble(command.symbol, SYMBOL_ASK, ask) ||
+      bid <= 0.0 ||
+      ask <= 0.0)
+   {
+      LogDebug("Bid/ask unavailable for symbol=" + command.symbol +
+               " bid=" + DoubleToString(bid, command.has_digits ? command.digits : 8) +
+               " ask=" + DoubleToString(ask, command.has_digits ? command.digits : 8));
+      return FailMarketValidation(command_id,
+                                  "SYMBOL_PRICE_UNAVAILABLE",
+                                  "Symbol bid/ask prices are unavailable.",
+                                  command,
+                                  received_at_local);
+   }
+
+   command.bid = bid;
+   command.ask = ask;
+   command.has_bid = true;
+   command.has_ask = true;
+   command.entry_price_reference = (command.side == "buy" ? ask : bid);
+   command.has_entry_price_reference = true;
+   LogDebug("Bid/ask read for " + command.symbol +
+            " bid=" + DoubleToString(bid, command.has_digits ? command.digits : 8) +
+            " ask=" + DoubleToString(ask, command.has_digits ? command.digits : 8) +
+            " entry_reference=" + DoubleToString(command.entry_price_reference, command.has_digits ? command.digits : 8));
+
+   const long trade_mode = SymbolInfoInteger(command.symbol, SYMBOL_TRADE_MODE);
+   LogDebug("Symbol trade mode for " + command.symbol + " mode=" + IntegerToString(trade_mode));
+   if(trade_mode == SYMBOL_TRADE_MODE_DISABLED)
+   {
+      return FailMarketValidation(command_id,
+                                  "SYMBOL_TRADE_DISABLED",
+                                  "Trading is disabled for the command symbol.",
+                                  command,
+                                  received_at_local);
+   }
+
+   const bool terminal_trade_allowed = (bool)TerminalInfoInteger(TERMINAL_TRADE_ALLOWED);
+   const bool account_trade_allowed = (bool)AccountInfoInteger(ACCOUNT_TRADE_ALLOWED);
+   const bool mql_trade_allowed = (bool)MQLInfoInteger(MQL_TRADE_ALLOWED);
+   LogDebug("Trade permissions terminal=" + (terminal_trade_allowed ? "true" : "false") +
+            " account=" + (account_trade_allowed ? "true" : "false") +
+            " mql=" + (mql_trade_allowed ? "true" : "false"));
+
+   if(!terminal_trade_allowed || !mql_trade_allowed)
+   {
+      return FailMarketValidation(command_id,
+                                  "TERMINAL_TRADE_DISABLED",
+                                  "Terminal or EA automated trading permission is disabled.",
+                                  command,
+                                  received_at_local);
+   }
+
+   if(!account_trade_allowed)
+   {
+      return FailMarketValidation(command_id,
+                                  "ACCOUNT_TRADE_DISABLED",
+                                  "Account trading permission is disabled.",
+                                  command,
+                                  received_at_local);
+   }
+
+   long stop_level_raw = 0;
+   if(SymbolInfoInteger(command.symbol, SYMBOL_TRADE_STOPS_LEVEL, stop_level_raw))
+   {
+      command.stop_level_points = (int)stop_level_raw;
+      command.has_stop_level_points = true;
+   }
+
+   double point = 0.0;
+   if(SymbolInfoDouble(command.symbol, SYMBOL_POINT, point) && point > 0.0)
+   {
+      command.point = point;
+      command.has_point = true;
+   }
+   LogDebug("Stop level market data for " + command.symbol +
+            " stop_level_points=" + (command.has_stop_level_points ? IntegerToString(command.stop_level_points) : "unavailable") +
+            " point=" + (command.has_point ? DoubleToString(command.point, 10) : "unavailable"));
+
+   long spread_raw = 0;
+   if(SymbolInfoInteger(command.symbol, SYMBOL_SPREAD, spread_raw))
+   {
+      command.spread_points = (int)spread_raw;
+      command.has_spread_points = true;
+      LogDebug("Spread read for " + command.symbol + " spread_points=" + IntegerToString(command.spread_points));
+   }
+   else
+   {
+      LogDebug("Spread unavailable for " + command.symbol);
+   }
+
+   if(command.has_spread_points && RejectIfSpreadAbovePoints > 0 && command.spread_points > RejectIfSpreadAbovePoints)
+   {
+      return FailMarketValidation(command_id,
+                                  "SPREAD_TOO_HIGH",
+                                  "Current symbol spread exceeds RejectIfSpreadAbovePoints.",
+                                  command,
+                                  received_at_local);
+   }
+
+   if(command.side == "buy")
+   {
+      if(command.stop_loss >= ask)
+      {
+         LogDebug("SL side validation failed for buy command_id=" + command_id +
+                  " stop_loss=" + DoubleToString(command.stop_loss, command.has_digits ? command.digits : 8) +
+                  " ask=" + DoubleToString(ask, command.has_digits ? command.digits : 8));
+         return FailMarketValidation(command_id,
+                                     "INVALID_STOP_LOSS",
+                                     "Buy stop_loss must be below the current Ask.",
+                                     command,
+                                     received_at_local);
+      }
+      LogDebug("SL side validation passed for buy command_id=" + command_id +
+               " stop_loss=" + DoubleToString(command.stop_loss, command.has_digits ? command.digits : 8) +
+               " ask=" + DoubleToString(ask, command.has_digits ? command.digits : 8));
+
+      if(HasActiveTakeProfit(command) && command.take_profit <= ask)
+      {
+         LogDebug("TP side validation failed for buy command_id=" + command_id +
+                  " take_profit=" + DoubleToString(command.take_profit, command.has_digits ? command.digits : 8) +
+                  " ask=" + DoubleToString(ask, command.has_digits ? command.digits : 8));
+         return FailMarketValidation(command_id,
+                                     "INVALID_TAKE_PROFIT",
+                                     "Buy take_profit must be above the current Ask.",
+                                     command,
+                                     received_at_local);
+      }
+      LogDebug("TP side validation passed for buy command_id=" + command_id +
+               " take_profit=" + (HasActiveTakeProfit(command) ? DoubleToString(command.take_profit, command.has_digits ? command.digits : 8) : "none") +
+               " ask=" + DoubleToString(ask, command.has_digits ? command.digits : 8));
+   }
+   else
+   {
+      if(command.stop_loss <= bid)
+      {
+         LogDebug("SL side validation failed for sell command_id=" + command_id +
+                  " stop_loss=" + DoubleToString(command.stop_loss, command.has_digits ? command.digits : 8) +
+                  " bid=" + DoubleToString(bid, command.has_digits ? command.digits : 8));
+         return FailMarketValidation(command_id,
+                                     "INVALID_STOP_LOSS",
+                                     "Sell stop_loss must be above the current Bid.",
+                                     command,
+                                     received_at_local);
+      }
+      LogDebug("SL side validation passed for sell command_id=" + command_id +
+               " stop_loss=" + DoubleToString(command.stop_loss, command.has_digits ? command.digits : 8) +
+               " bid=" + DoubleToString(bid, command.has_digits ? command.digits : 8));
+
+      if(HasActiveTakeProfit(command) && command.take_profit >= bid)
+      {
+         LogDebug("TP side validation failed for sell command_id=" + command_id +
+                  " take_profit=" + DoubleToString(command.take_profit, command.has_digits ? command.digits : 8) +
+                  " bid=" + DoubleToString(bid, command.has_digits ? command.digits : 8));
+         return FailMarketValidation(command_id,
+                                     "INVALID_TAKE_PROFIT",
+                                     "Sell take_profit must be below the current Bid.",
+                                     command,
+                                     received_at_local);
+      }
+      LogDebug("TP side validation passed for sell command_id=" + command_id +
+               " take_profit=" + (HasActiveTakeProfit(command) ? DoubleToString(command.take_profit, command.has_digits ? command.digits : 8) : "none") +
+               " bid=" + DoubleToString(bid, command.has_digits ? command.digits : 8));
+   }
+
+   if(command.has_stop_level_points && command.has_point && command.stop_level_points > 0)
+   {
+      const double minimum_distance = command.stop_level_points * command.point;
+      const double sl_distance = MathAbs(command.entry_price_reference - command.stop_loss);
+
+      if(sl_distance < minimum_distance)
+      {
+         LogDebug("Stop level SL validation failed command_id=" + command_id +
+                  " sl_distance=" + DoubleToString(sl_distance, 10) +
+                  " minimum_distance=" + DoubleToString(minimum_distance, 10));
+         return FailMarketValidation(command_id,
+                                     "STOP_LOSS_TOO_CLOSE",
+                                     "stop_loss is closer than the broker stop level.",
+                                     command,
+                                     received_at_local);
+      }
+
+      if(HasActiveTakeProfit(command))
+      {
+         const double tp_distance = MathAbs(command.take_profit - command.entry_price_reference);
+         if(tp_distance < minimum_distance)
+         {
+            LogDebug("Stop level TP validation failed command_id=" + command_id +
+                     " tp_distance=" + DoubleToString(tp_distance, 10) +
+                     " minimum_distance=" + DoubleToString(minimum_distance, 10));
+            return FailMarketValidation(command_id,
+                                        "TAKE_PROFIT_TOO_CLOSE",
+                                        "take_profit is closer than the broker stop level.",
+                                        command,
+                                        received_at_local);
+         }
+      }
+
+      LogDebug("Stop level validation passed command_id=" + command_id +
+               " stop_level_points=" + IntegerToString(command.stop_level_points));
+   }
+   else
+   {
+      LogDebug("Stop level validation skipped or not required command_id=" + command_id);
+   }
+
+   LogInfo("Market validation accepted command " + command_id + ". No trade was executed.");
+   return true;
 }
 
 bool ValidateRequiredField(const string command_json,
@@ -981,6 +1401,7 @@ bool ParseAndValidateCommand(const string command_json,
       RejectCommand(command_id, "INVALID_RISK_PERCENT", "Command risk_percent must be positive.", command, received_at_local);
       return false;
    }
+   LogDebug("Parsed risk_percent for command " + command_id + ": " + DoubleToString(command.risk_percent, 4));
 
    if(!JsonExtractDoubleNumber(command_json, "stop_loss", command.stop_loss) ||
       command.stop_loss == 0.0)
@@ -988,6 +1409,8 @@ bool ParseAndValidateCommand(const string command_json,
       RejectCommand(command_id, "INVALID_STOP_LOSS", "Command stop_loss must be present and non-zero.", command, received_at_local);
       return false;
    }
+   command.has_stop_loss = true;
+   LogDebug("Parsed stop_loss for command " + command_id + ": " + DoubleToString(command.stop_loss, 8));
 
    if(!JsonExtractBool(command_json, "dry_run", command.dry_run))
    {
@@ -1004,6 +1427,7 @@ bool ParseAndValidateCommand(const string command_json,
          return false;
       }
       command.has_take_profit = true;
+      LogDebug("Parsed take_profit for command " + command_id + ": " + DoubleToString(command.take_profit, 8));
    }
 
    if(JsonFieldExists(command_json, "comment"))
@@ -1124,10 +1548,13 @@ void ProcessReadyCommand(const string ready_file_name)
    if(!ParseAndValidateCommand(command_json, command_id, command, received_at_local))
       return;
 
+   if(!ValidateMarketForCommand(command_id, command, received_at_local))
+      return;
+
    FinalizeCommand(command_id,
                    "accepted",
-                   "COMMAND_RECEIVED",
-                   "Command received by EA. No trade was executed in Phase 3.",
+                   "MARKET_VALIDATION_PASSED",
+                   "Command passed protocol and market validation. No trade was executed in Phase 4.",
                    command,
                    received_at_local,
                    PROCESSED_FOLDER,
@@ -1188,6 +1615,7 @@ string BuildStatusJson()
    json += "  \"type\": \"mtchartbridge.status\",\n";
    json += "  \"product\": " + JsonString(ProductName) + ",\n";
    json += "  \"version\": " + JsonString(MTCB_VERSION) + ",\n";
+   json += "  \"ea_phase\": " + JsonString(EA_PHASE) + ",\n";
    json += "  \"ea_state\": \"running\",\n";
    json += "  \"account_login\": " + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + ",\n";
    json += "  \"account_server\": " + JsonString(AccountInfoString(ACCOUNT_SERVER)) + ",\n";
@@ -1202,6 +1630,8 @@ string BuildStatusJson()
    json += "  \"enforce_command_ttl\": " + (EnforceCommandTtl ? "true" : "false") + ",\n";
    json += "  \"max_command_ttl_ms\": " + IntegerToString(MaxCommandTtlMs) + ",\n";
    json += "  \"processed_command_cache_size\": " + IntegerToString(g_processed_command_cache_size) + ",\n";
+   json += "  \"reject_if_spread_above_points\": " + IntegerToString(RejectIfSpreadAbovePoints) + ",\n";
+   json += "  \"allowed_symbols\": " + JsonString(AllowedSymbols) + ",\n";
    json += "  \"timestamp_local\": " + JsonString(LocalTimestamp()) + ",\n";
    json += "  \"heartbeat_counter\": " + IntegerToString((long)g_heartbeat_counter) + "\n";
    json += "}\n";
@@ -1232,10 +1662,12 @@ int OnInit()
       g_processed_command_cache_size = 1;
    }
 
-   LogInfo("Initializing MTChartBridgeEA phase 3.");
+   LogInfo("Initializing MTChartBridgeEA phase 4.");
    LogInfo("Command TTL enforcement=" + (EnforceCommandTtl ? "true" : "false") +
            " max_ttl_ms=" + IntegerToString(MaxCommandTtlMs) +
-           " processed_cache_size=" + IntegerToString(g_processed_command_cache_size));
+           " processed_cache_size=" + IntegerToString(g_processed_command_cache_size) +
+           " reject_if_spread_above_points=" + IntegerToString(RejectIfSpreadAbovePoints) +
+           " allowed_symbols=" + AllowedSymbols);
    LogInfo("Common folder for Chrome Extension access later: " + COMMON_FOLDER_HINT);
 
    if(!EnsureFolderStructure())
@@ -1281,6 +1713,6 @@ void OnTimer()
    if(!WriteStatusFile())
       LogLastErrorThrottled("WriteStatusFile");
 
-   // Phase 3 reads at most one local command per timer tick and never trades.
+   // Phase 4 reads at most one local command per timer tick, validates market state, and never trades.
    ProcessOneReadyCommand();
 }

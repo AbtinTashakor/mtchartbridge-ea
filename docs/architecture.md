@@ -12,7 +12,7 @@ The Chrome Extension and MT5 do not communicate over the internet, sockets, WebR
 
 - Chrome Extension: creates command files from user actions.
 - Local Shared Folder: stores command and response files.
-- MT5 Expert Advisor: reads commands, validates them, calculates final volume in MT5, and writes responses.
+- MT5 Expert Advisor: reads commands, validates them, and writes responses. Final volume remains the EA's responsibility and must be calculated in MT5 in a later phase.
 
 ## Non-Goals
 

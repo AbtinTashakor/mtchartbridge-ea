@@ -6,10 +6,10 @@ The protocol is file based:
 
 - Commands are written by the extension.
 - Commands are read and validated by the EA.
-- Final trade volume is calculated inside MT5.
+- Final trade volume is the EA's responsibility and must be calculated inside MT5 in a later phase.
 - Responses are written by the EA.
 
-Phase 3 uses this local folder structure under `Terminal/Common/Files/MTChartBridge/`:
+Phase 4 uses this local folder structure under `Terminal/Common/Files/MTChartBridge/`:
 
 ```text
 inbox/
@@ -24,7 +24,12 @@ The EA only processes commands with a ready marker. It writes responses to `outb
 
 Accepted commands are moved to `processed/`. Invalid, missing, unreadable, expired, or duplicate commands are moved to `failed/` when possible.
 
-Phase 3 hardens protocol validation, checks command TTL, and keeps a session-level duplicate-command cache. It does not execute trades and does not calculate final trade volume yet.
+Phase 4 keeps Phase 3 protocol validation, command TTL checks, and session-level duplicate-command detection. After protocol validation passes, it validates live MT5 market state for the command symbol. It does not execute trades and does not calculate final trade volume yet.
+
+New Phase 4 EA inputs:
+
+- `RejectIfSpreadAbovePoints`: default `0`; values greater than `0` reject commands when current spread points are above the input.
+- `AllowedSymbols`: default empty; when set, a comma-separated symbol allowlist matched case-insensitively after trimming spaces.
 
 ## Command Fields
 
@@ -51,14 +56,48 @@ Optional fields:
 
 All responses include `type`, `id`, `status`, `code`, `message`, `ea_phase`, `trace_id`, `timestamp_local`, `received_at_local`, and `processed_at_local`. When parsed from the command, responses also include `symbol`, `side`, `dry_run`, `source`, and `comment`.
 
+Market validation responses also include available market context:
+
+- `bid`
+- `ask`
+- `entry_price_reference`
+- `spread_points`
+- `stop_level_points`
+- `point`
+- `digits`
+- `stop_loss`
+- `take_profit`
+- `allowed_symbols`
+- `reject_if_spread_above_points`
+
 Accepted commands return:
 
 ```json
 {
   "status": "accepted",
-  "code": "COMMAND_RECEIVED"
+  "code": "MARKET_VALIDATION_PASSED"
 }
 ```
+
+The accepted response message is:
+
+```text
+Command passed protocol and market validation. No trade was executed in Phase 4.
+```
+
+Phase 4 market validation can reject commands with:
+
+- `SYMBOL_NOT_ALLOWED`
+- `SYMBOL_SELECT_FAILED`
+- `SYMBOL_PRICE_UNAVAILABLE`
+- `SYMBOL_TRADE_DISABLED`
+- `TERMINAL_TRADE_DISABLED`
+- `ACCOUNT_TRADE_DISABLED`
+- `SPREAD_TOO_HIGH`
+- `INVALID_STOP_LOSS`
+- `INVALID_TAKE_PROFIT`
+- `STOP_LOSS_TOO_CLOSE`
+- `TAKE_PROFIT_TOO_CLOSE`
 
 Expired commands return:
 
@@ -78,4 +117,4 @@ Duplicate commands within the same EA session return:
 }
 ```
 
-See `command.example.json` and `response.example.json` for the Phase 3 message shape.
+See `command.example.json` and `response.example.json` for the Phase 4 message shape.
