@@ -8,8 +8,9 @@ The protocol is file based:
 - Commands are read and validated by the EA.
 - Final trade volume is calculated by the EA inside MT5.
 - Responses are written by the EA.
+- No live order is sent in Phase 6.
 
-Phase 5 uses this local folder structure under `Terminal/Common/Files/MTChartBridge/`:
+Phase 6 uses this local folder structure under `Terminal/Common/Files/MTChartBridge/`:
 
 ```text
 inbox/
@@ -24,7 +25,7 @@ The EA only processes commands with a ready marker. It writes responses to `outb
 
 Accepted commands are moved to `processed/`. Invalid, missing, unreadable, expired, or duplicate commands are moved to `failed/` when possible.
 
-Phase 5 keeps Phase 3 protocol validation, command TTL checks, session-level duplicate-command detection, and Phase 4 live market validation. After market validation passes, it calculates risk amount and final volume inside MT5. It does not execute trades.
+Phase 6 keeps Phase 3 protocol validation, command TTL checks, session-level duplicate-command detection, Phase 4 live market validation, and Phase 5 risk calculation. After risk calculation passes, it requires `dry_run=true`, builds an `MqlTradeRequest` preview, and optionally runs `OrderCheck`. It does not call `OrderSend` and does not execute trades.
 
 Market-validation EA inputs:
 
@@ -35,6 +36,11 @@ Risk EA inputs:
 
 - `MaxRiskPercent`: default `2.0`; rejects commands whose `risk_percent` is above this value.
 - `MaxVolume`: default `0.0`; when greater than `0`, caps calculated volume down to the largest valid `SYMBOL_VOLUME_STEP` not exceeding this value.
+
+Execution-check EA inputs:
+
+- `EnableOrderCheck`: default `true`; when enabled, the EA runs `OrderCheck` against the built request. When disabled, the EA returns a request preview without `order_check_*` fields.
+- `MaxDeviationPoints`: default `20`; applied to the no-trade request preview. Negative values reject with `INVALID_DEVIATION_POINTS`.
 
 ## Command Fields
 
@@ -93,20 +99,56 @@ Risk calculation responses include risk fields as they become available:
 - `max_volume`
 - `volume_normalized_down`
 
+Execution-check responses include request preview fields after the request is built:
+
+- `enable_order_check`
+- `max_deviation_points`
+- `request_action`
+- `request_type`
+- `request_symbol`
+- `request_volume`
+- `request_price`
+- `request_sl`
+- `request_tp`
+- `request_deviation`
+- `request_magic`
+- `request_type_time`
+- `request_type_filling`
+
+When `EnableOrderCheck=true` and `OrderCheck` is reached, responses also include:
+
+- `order_check_call_success`
+- `order_check_retcode`
+- `order_check_comment`
+- `order_check_balance`
+- `order_check_equity`
+- `order_check_profit`
+- `order_check_margin`
+- `order_check_margin_free`
+- `order_check_margin_level`
+- `last_error`
+- `last_error_description`
+
+`ORDER_CHECK_PASSED_NO_TRADE` requires `OrderCheck` to return `true` and `order_check_retcode` to equal `TRADE_RETCODE_DONE`. `ORDER_CHECK_REJECTED` is only used when `OrderCheck` returns `true` with a meaningful non-zero non-success trade retcode. If `OrderCheck` returns `false`, or if the check result retcode remains `0` or unavailable, the EA returns `ORDER_CHECK_FAILED` with diagnostics instead of treating the result as a server rejection.
+
+Responses do not include final live execution identifiers such as order, deal, ticket, position, execution price, or fill price fields.
+
 Accepted commands return:
 
 ```json
 {
   "status": "accepted",
-  "code": "RISK_CALCULATED"
+  "code": "ORDER_CHECK_PASSED_NO_TRADE"
 }
 ```
 
 The accepted response message is:
 
 ```text
-Command passed validation and risk calculation. No trade was executed in Phase 5.
+Command passed validation, risk calculation, and MT5 OrderCheck. No trade was executed in Phase 6.
 ```
+
+When `EnableOrderCheck=false`, accepted commands return `EXECUTION_PREVIEW_READY_NO_TRADE` and omit `order_check_*` fields.
 
 Market validation can reject commands with:
 
@@ -133,6 +175,15 @@ Risk calculation can reject commands with:
 - `RISK_TOO_SMALL_FOR_MIN_VOLUME`
 - `ESTIMATED_LOSS_EXCEEDS_RISK`
 
+Execution checking can reject commands with:
+
+- `DRY_RUN_REQUIRED`
+- `INVALID_DEVIATION_POINTS`
+- `ORDER_REQUEST_BUILD_FAILED`
+- `ORDER_FILLING_MODE_UNAVAILABLE`
+- `ORDER_CHECK_FAILED`
+- `ORDER_CHECK_REJECTED`
+
 Expired commands return:
 
 ```json
@@ -151,4 +202,9 @@ Duplicate commands within the same EA session return:
 }
 ```
 
-See `command.example.json` and `response.example.json` for the Phase 5 message shape.
+Phase 6 accepted codes:
+
+- `ORDER_CHECK_PASSED_NO_TRADE`
+- `EXECUTION_PREVIEW_READY_NO_TRADE`
+
+See `command.example.json` and `response.example.json` for the Phase 6 message shape.

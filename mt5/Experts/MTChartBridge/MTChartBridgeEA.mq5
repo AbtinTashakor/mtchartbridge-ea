@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //| MTChartBridgeEA.mq5                                              |
-//| Phase 5: risk engine / volume calculation, no trade.              |
+//| Phase 6: execution safety check / OrderCheck, no trade.           |
 //+------------------------------------------------------------------+
 #property copyright "MTChartBridge"
 #property link      ""
@@ -18,6 +18,8 @@ input int    RejectIfSpreadAbovePoints = 0;
 input string AllowedSymbols = "";
 input double MaxRiskPercent = 2.0;
 input double MaxVolume = 0.0;
+input bool   EnableOrderCheck = true;
+input int    MaxDeviationPoints = 20;
 
 #define MTCB_VERSION "0.1.0"
 
@@ -29,7 +31,7 @@ const string OUTBOX_FOLDER      = "MTChartBridge\\outbox";
 const string PROCESSED_FOLDER   = "MTChartBridge\\processed";
 const string FAILED_FOLDER      = "MTChartBridge\\failed";
 const string COMMON_FOLDER_HINT = "Terminal/Common/Files/MTChartBridge";
-const string EA_PHASE           = "phase-5-risk-engine";
+const string EA_PHASE           = "phase-6-execution-check";
 
 int      g_polling_interval_ms = 250;
 int      g_processed_command_cache_size = 200;
@@ -79,6 +81,10 @@ struct CommandData
    bool   has_volume_constraints;
    bool   has_max_volume;
    bool   has_volume_normalized_down;
+   bool   has_execution_check_settings;
+   bool   has_trade_request;
+   bool   has_order_check_result;
+   bool   has_last_error_diagnostics;
    bool   has_bid;
    bool   has_ask;
    bool   has_entry_price_reference;
@@ -108,6 +114,30 @@ struct CommandData
    double volume_step;
    double max_volume;
    bool   volume_normalized_down;
+   bool   enable_order_check;
+   int    max_deviation_points;
+   string request_action;
+   string request_type;
+   string request_symbol;
+   double request_volume;
+   double request_price;
+   double request_sl;
+   double request_tp;
+   int    request_deviation;
+   int    request_magic;
+   string request_type_time;
+   string request_type_filling;
+   bool   order_check_call_success;
+   long   order_check_retcode;
+   string order_check_comment;
+   double order_check_balance;
+   double order_check_equity;
+   double order_check_profit;
+   double order_check_margin;
+   double order_check_margin_free;
+   double order_check_margin_level;
+   int    last_error;
+   string last_error_description;
 };
 
 ProcessedCommandCacheEntry g_processed_command_cache[];
@@ -761,6 +791,10 @@ void ResetCommandData(CommandData &command)
    command.has_volume_constraints = false;
    command.has_max_volume = false;
    command.has_volume_normalized_down = false;
+   command.has_execution_check_settings = false;
+   command.has_trade_request = false;
+   command.has_order_check_result = false;
+   command.has_last_error_diagnostics = false;
    command.has_bid = false;
    command.has_ask = false;
    command.has_entry_price_reference = false;
@@ -790,6 +824,30 @@ void ResetCommandData(CommandData &command)
    command.volume_step = 0.0;
    command.max_volume = 0.0;
    command.volume_normalized_down = false;
+   command.enable_order_check = false;
+   command.max_deviation_points = 0;
+   command.request_action = "";
+   command.request_type = "";
+   command.request_symbol = "";
+   command.request_volume = 0.0;
+   command.request_price = 0.0;
+   command.request_sl = 0.0;
+   command.request_tp = 0.0;
+   command.request_deviation = 0;
+   command.request_magic = 0;
+   command.request_type_time = "";
+   command.request_type_filling = "";
+   command.order_check_call_success = false;
+   command.order_check_retcode = 0;
+   command.order_check_comment = "";
+   command.order_check_balance = 0.0;
+   command.order_check_equity = 0.0;
+   command.order_check_profit = 0.0;
+   command.order_check_margin = 0.0;
+   command.order_check_margin_free = 0.0;
+   command.order_check_margin_level = 0.0;
+   command.last_error = 0;
+   command.last_error_description = "";
 }
 
 string BuildResponseJson(const string command_id,
@@ -872,6 +930,42 @@ string BuildResponseJson(const string command_id,
       json += "  \"max_volume\": " + JsonDouble(command.max_volume, 8) + ",\n";
    if(command.has_volume_normalized_down)
       json += "  \"volume_normalized_down\": " + (command.volume_normalized_down ? "true" : "false") + ",\n";
+   if(command.has_execution_check_settings)
+   {
+      json += "  \"enable_order_check\": " + (command.enable_order_check ? "true" : "false") + ",\n";
+      json += "  \"max_deviation_points\": " + IntegerToString(command.max_deviation_points) + ",\n";
+   }
+   if(command.has_trade_request)
+   {
+      json += "  \"request_action\": " + JsonString(command.request_action) + ",\n";
+      json += "  \"request_type\": " + JsonString(command.request_type) + ",\n";
+      json += "  \"request_symbol\": " + JsonString(command.request_symbol) + ",\n";
+      json += "  \"request_volume\": " + JsonDouble(command.request_volume, 8) + ",\n";
+      json += "  \"request_price\": " + JsonDouble(command.request_price, command.has_digits ? command.digits : 8) + ",\n";
+      json += "  \"request_sl\": " + JsonDouble(command.request_sl, command.has_digits ? command.digits : 8) + ",\n";
+      json += "  \"request_tp\": " + JsonDouble(command.request_tp, command.has_digits ? command.digits : 8) + ",\n";
+      json += "  \"request_deviation\": " + IntegerToString(command.request_deviation) + ",\n";
+      json += "  \"request_magic\": " + IntegerToString(command.request_magic) + ",\n";
+      json += "  \"request_type_time\": " + JsonString(command.request_type_time) + ",\n";
+      json += "  \"request_type_filling\": " + JsonString(command.request_type_filling) + ",\n";
+   }
+   if(command.has_order_check_result)
+   {
+      json += "  \"order_check_call_success\": " + (command.order_check_call_success ? "true" : "false") + ",\n";
+      json += "  \"order_check_retcode\": " + IntegerToString(command.order_check_retcode) + ",\n";
+      json += "  \"order_check_comment\": " + JsonString(command.order_check_comment) + ",\n";
+      json += "  \"order_check_balance\": " + JsonDouble(command.order_check_balance, 2) + ",\n";
+      json += "  \"order_check_equity\": " + JsonDouble(command.order_check_equity, 2) + ",\n";
+      json += "  \"order_check_profit\": " + JsonDouble(command.order_check_profit, 2) + ",\n";
+      json += "  \"order_check_margin\": " + JsonDouble(command.order_check_margin, 2) + ",\n";
+      json += "  \"order_check_margin_free\": " + JsonDouble(command.order_check_margin_free, 2) + ",\n";
+      json += "  \"order_check_margin_level\": " + JsonDouble(command.order_check_margin_level, 2) + ",\n";
+   }
+   if(command.has_last_error_diagnostics)
+   {
+      json += "  \"last_error\": " + IntegerToString(command.last_error) + ",\n";
+      json += "  \"last_error_description\": " + JsonString(command.last_error_description) + ",\n";
+   }
 
    json += "  \"trace_id\": " + JsonString(BuildTraceId(command_id)) + ",\n";
    json += "  \"timestamp_local\": " + JsonString(processed_at_local) + ",\n";
@@ -1070,6 +1164,33 @@ bool FailRiskCalculation(const string command_id,
    return false;
 }
 
+bool RejectExecutionCheckCommand(const string command_id,
+                                 const string code,
+                                 const string message,
+                                 CommandData &command,
+                                 const string received_at_local)
+{
+   LogInfo("Execution check rejected command " + command_id + " code=" + code + " message=" + message);
+   return FinalizeCommand(command_id,
+                          "rejected",
+                          code,
+                          message,
+                          command,
+                          received_at_local,
+                          FAILED_FOLDER,
+                          true);
+}
+
+bool FailExecutionCheck(const string command_id,
+                        const string code,
+                        const string message,
+                        CommandData &command,
+                        const string received_at_local)
+{
+   RejectExecutionCheckCommand(command_id, code, message, command, received_at_local);
+   return false;
+}
+
 string TrimWhitespace(const string value)
 {
    int start = 0;
@@ -1135,6 +1256,391 @@ double NormalizeVolumeDown(const double volume, const double volume_step)
 
    const double steps = MathFloor(volume / volume_step);
    return NormalizeDouble(steps * volume_step, 8);
+}
+
+string SanitizedTradeComment(CommandData &command, const string command_id)
+{
+   string source = "";
+   if(command.has_comment)
+      source = TrimWhitespace(command.comment);
+   if(source == "")
+      source = ProductName + ":" + command_id;
+
+   string sanitized = "";
+   const int length = StringLen(source);
+   for(int i = 0; i < length; i++)
+   {
+      const ushort ch = StringGetCharacter(source, i);
+      if(ch == 10 || ch == 13 || ch == 9)
+         sanitized += " ";
+      else if(ch >= 32)
+         sanitized += ShortToString(ch);
+   }
+
+   sanitized = TrimWhitespace(sanitized);
+   if(sanitized == "")
+      sanitized = ProductName;
+
+   if(StringLen(sanitized) > 31)
+      sanitized = StringSubstr(sanitized, 0, 31);
+
+   return sanitized;
+}
+
+bool SelectBrokerFillingMode(const string symbol, ENUM_ORDER_TYPE_FILLING &filling_mode)
+{
+   long supported_modes = 0;
+   ResetLastError();
+   if(!SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE, supported_modes))
+   {
+      LogLastError("SymbolInfoInteger(" + symbol + ",SYMBOL_FILLING_MODE)");
+      return false;
+   }
+
+   long execution_mode = 0;
+   ResetLastError();
+   if(!SymbolInfoInteger(symbol, SYMBOL_TRADE_EXEMODE, execution_mode))
+   {
+      LogLastError("SymbolInfoInteger(" + symbol + ",SYMBOL_TRADE_EXEMODE)");
+      return false;
+   }
+
+   if((supported_modes & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
+   {
+      filling_mode = ORDER_FILLING_FOK;
+      return true;
+   }
+
+   if((supported_modes & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
+   {
+      filling_mode = ORDER_FILLING_IOC;
+      return true;
+   }
+
+   if(execution_mode != SYMBOL_TRADE_EXECUTION_MARKET)
+   {
+      filling_mode = ORDER_FILLING_RETURN;
+      return true;
+   }
+
+   return false;
+}
+
+string TradeActionToString(const ENUM_TRADE_REQUEST_ACTIONS action)
+{
+   switch(action)
+   {
+      case TRADE_ACTION_DEAL:
+         return "TRADE_ACTION_DEAL";
+      case TRADE_ACTION_PENDING:
+         return "TRADE_ACTION_PENDING";
+      case TRADE_ACTION_SLTP:
+         return "TRADE_ACTION_SLTP";
+      case TRADE_ACTION_MODIFY:
+         return "TRADE_ACTION_MODIFY";
+      case TRADE_ACTION_REMOVE:
+         return "TRADE_ACTION_REMOVE";
+      case TRADE_ACTION_CLOSE_BY:
+         return "TRADE_ACTION_CLOSE_BY";
+   }
+
+   return "TRADE_ACTION_UNKNOWN";
+}
+
+string OrderTypeToString(const ENUM_ORDER_TYPE order_type)
+{
+   switch(order_type)
+   {
+      case ORDER_TYPE_BUY:
+         return "ORDER_TYPE_BUY";
+      case ORDER_TYPE_SELL:
+         return "ORDER_TYPE_SELL";
+      case ORDER_TYPE_BUY_LIMIT:
+         return "ORDER_TYPE_BUY_LIMIT";
+      case ORDER_TYPE_SELL_LIMIT:
+         return "ORDER_TYPE_SELL_LIMIT";
+      case ORDER_TYPE_BUY_STOP:
+         return "ORDER_TYPE_BUY_STOP";
+      case ORDER_TYPE_SELL_STOP:
+         return "ORDER_TYPE_SELL_STOP";
+      case ORDER_TYPE_BUY_STOP_LIMIT:
+         return "ORDER_TYPE_BUY_STOP_LIMIT";
+      case ORDER_TYPE_SELL_STOP_LIMIT:
+         return "ORDER_TYPE_SELL_STOP_LIMIT";
+      case ORDER_TYPE_CLOSE_BY:
+         return "ORDER_TYPE_CLOSE_BY";
+   }
+
+   return "ORDER_TYPE_UNKNOWN";
+}
+
+string OrderTypeTimeToString(const ENUM_ORDER_TYPE_TIME type_time)
+{
+   switch(type_time)
+   {
+      case ORDER_TIME_GTC:
+         return "ORDER_TIME_GTC";
+      case ORDER_TIME_DAY:
+         return "ORDER_TIME_DAY";
+      case ORDER_TIME_SPECIFIED:
+         return "ORDER_TIME_SPECIFIED";
+      case ORDER_TIME_SPECIFIED_DAY:
+         return "ORDER_TIME_SPECIFIED_DAY";
+   }
+
+   return "ORDER_TIME_UNKNOWN";
+}
+
+string OrderFillingToString(const ENUM_ORDER_TYPE_FILLING filling_mode)
+{
+   switch(filling_mode)
+   {
+      case ORDER_FILLING_FOK:
+         return "ORDER_FILLING_FOK";
+      case ORDER_FILLING_IOC:
+         return "ORDER_FILLING_IOC";
+      case ORDER_FILLING_RETURN:
+         return "ORDER_FILLING_RETURN";
+      case ORDER_FILLING_BOC:
+         return "ORDER_FILLING_BOC";
+   }
+
+   return "ORDER_FILLING_UNKNOWN";
+}
+
+void StoreTradeRequestPreview(CommandData &command, MqlTradeRequest &request)
+{
+   command.request_action = TradeActionToString(request.action);
+   command.request_type = OrderTypeToString(request.type);
+   command.request_symbol = request.symbol;
+   command.request_volume = request.volume;
+   command.request_price = request.price;
+   command.request_sl = request.sl;
+   command.request_tp = request.tp;
+   command.request_deviation = (int)request.deviation;
+   command.request_magic = (int)request.magic;
+   command.request_type_time = OrderTypeTimeToString(request.type_time);
+   command.request_type_filling = OrderFillingToString(request.type_filling);
+   command.has_trade_request = true;
+}
+
+string LastErrorDescription(const int error_code)
+{
+   if(error_code == 0)
+      return "No terminal runtime error was reported.";
+
+   return "MT5 runtime error " + IntegerToString(error_code) + ".";
+}
+
+void StoreLastErrorDiagnostics(CommandData &command, const int last_error)
+{
+   command.last_error = last_error;
+   command.last_error_description = LastErrorDescription(last_error);
+   command.has_last_error_diagnostics = true;
+}
+
+void StoreOrderCheckResult(CommandData &command,
+                           const bool order_check_call_success,
+                           MqlTradeCheckResult &check_result)
+{
+   command.order_check_call_success = order_check_call_success;
+   command.order_check_retcode = (long)check_result.retcode;
+   command.order_check_comment = check_result.comment;
+   command.order_check_balance = check_result.balance;
+   command.order_check_equity = check_result.equity;
+   command.order_check_profit = check_result.profit;
+   command.order_check_margin = check_result.margin;
+   command.order_check_margin_free = check_result.margin_free;
+   command.order_check_margin_level = check_result.margin_level;
+   command.has_order_check_result = true;
+}
+
+bool IsSuccessfulOrderCheckRetcode(const long retcode)
+{
+   return retcode == TRADE_RETCODE_DONE;
+}
+
+bool BuildMarketTradeRequest(const string command_id,
+                             CommandData &command,
+                             MqlTradeRequest &request,
+                             const string received_at_local)
+{
+   ZeroMemory(request);
+
+   ENUM_ORDER_TYPE_FILLING filling_mode = ORDER_FILLING_FOK;
+   if(!SelectBrokerFillingMode(command.symbol, filling_mode))
+   {
+      return FailExecutionCheck(command_id,
+                                "ORDER_FILLING_MODE_UNAVAILABLE",
+                                "Broker-compatible filling mode could not be determined safely.",
+                                command,
+                                received_at_local);
+   }
+
+   const bool is_buy = (command.side == "buy");
+   const double request_price = is_buy ? command.ask : command.bid;
+   if(request_price <= 0.0 || command.volume <= 0.0 || command.stop_loss == 0.0)
+   {
+      return FailExecutionCheck(command_id,
+                                "ORDER_REQUEST_BUILD_FAILED",
+                                "Trade request preview could not be built from validated command data.",
+                                command,
+                                received_at_local);
+   }
+
+   request.action = TRADE_ACTION_DEAL;
+   request.type = is_buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   request.symbol = command.symbol;
+   request.volume = command.volume;
+   request.price = request_price;
+   request.sl = command.stop_loss;
+   request.tp = HasActiveTakeProfit(command) ? command.take_profit : 0.0;
+   request.deviation = (ulong)MaxDeviationPoints;
+   request.magic = (ulong)MagicNumber;
+   request.comment = SanitizedTradeComment(command, command_id);
+   request.type_time = ORDER_TIME_GTC;
+   request.type_filling = filling_mode;
+
+   StoreTradeRequestPreview(command, request);
+
+   LogDebug("Phase 6 request command_id=" + command_id +
+            " type=" + command.request_type +
+            " price=" + DoubleToString(command.request_price, command.has_digits ? command.digits : 8) +
+            " volume=" + DoubleToString(command.request_volume, 8) +
+            " sl=" + DoubleToString(command.request_sl, command.has_digits ? command.digits : 8) +
+            " tp=" + DoubleToString(command.request_tp, command.has_digits ? command.digits : 8) +
+            " filling=" + command.request_type_filling);
+   return true;
+}
+
+bool RunExecutionCheckForCommand(const string command_id,
+                                 CommandData &command,
+                                 const string received_at_local,
+                                 string &accepted_code,
+                                 string &accepted_message)
+{
+   LogInfo("Phase 6 execution check started for command " + command_id + ".");
+
+   command.enable_order_check = EnableOrderCheck;
+   command.max_deviation_points = MaxDeviationPoints;
+   command.has_execution_check_settings = true;
+
+   LogDebug("Phase 6 settings command_id=" + command_id +
+            " dry_run=" + (command.dry_run ? "true" : "false") +
+            " enable_order_check=" + (EnableOrderCheck ? "true" : "false") +
+            " max_deviation_points=" + IntegerToString(MaxDeviationPoints));
+
+   if(!command.dry_run)
+   {
+      LogInfo("Phase 6 dry_run gate rejected command " + command_id + ".");
+      return FailExecutionCheck(command_id,
+                                "DRY_RUN_REQUIRED",
+                                "Phase 6 only supports dry_run=true. No trade was executed.",
+                                command,
+                                received_at_local);
+   }
+   LogDebug("Phase 6 dry_run gate passed for command " + command_id + ".");
+
+   if(MaxDeviationPoints < 0)
+   {
+      return FailExecutionCheck(command_id,
+                                "INVALID_DEVIATION_POINTS",
+                                "MaxDeviationPoints must be greater than or equal to 0.",
+                                command,
+                                received_at_local);
+   }
+
+   MqlTradeRequest request;
+   if(!BuildMarketTradeRequest(command_id, command, request, received_at_local))
+      return false;
+
+   LogInfo("Phase 6 prepared " + command.request_type +
+           " request for command " + command_id +
+           " volume=" + DoubleToString(command.request_volume, 8) +
+           " price=" + DoubleToString(command.request_price, command.has_digits ? command.digits : 8) +
+           " filling=" + command.request_type_filling +
+           ". No trade was executed.");
+
+   if(!EnableOrderCheck)
+   {
+      LogInfo("OrderCheck disabled by input for command " + command_id + ". Returning execution preview only.");
+      accepted_code = "EXECUTION_PREVIEW_READY_NO_TRADE";
+      accepted_message = "Command passed validation and risk calculation. Execution request preview was built. No trade was executed in Phase 6.";
+      return true;
+   }
+
+   MqlTradeCheckResult check_result;
+   ZeroMemory(check_result);
+
+   ResetLastError();
+   const bool check_call_succeeded = OrderCheck(request, check_result);
+   const int order_check_last_error = GetLastError();
+   StoreOrderCheckResult(command, check_call_succeeded, check_result);
+   StoreLastErrorDiagnostics(command, order_check_last_error);
+
+   if(command.order_check_comment == "")
+      command.order_check_comment = "OrderCheck returned retcode " + IntegerToString(command.order_check_retcode) + ".";
+
+   LogDebug("OrderCheck call command_id=" + command_id +
+            " call_result=" + (check_call_succeeded ? "true" : "false") +
+            " retcode=" + IntegerToString(command.order_check_retcode) +
+            " comment=" + command.order_check_comment +
+            " last_error=" + IntegerToString(order_check_last_error));
+
+   if(!check_call_succeeded)
+   {
+      LogInfo("OrderCheck call failed for command " + command_id +
+              " retcode=" + IntegerToString(command.order_check_retcode) +
+              " comment=" + command.order_check_comment +
+              " last_error=" + IntegerToString(order_check_last_error) +
+              ". No trade was executed.");
+      LogDebug("Final OrderCheck-derived status=rejected code=ORDER_CHECK_FAILED command_id=" + command_id);
+      return FailExecutionCheck(command_id,
+                                "ORDER_CHECK_FAILED",
+                                "MT5 OrderCheck call failed. No trade was executed.",
+                                command,
+                                received_at_local);
+   }
+
+   if(command.order_check_retcode == 0)
+   {
+      LogInfo("OrderCheck returned ambiguous retcode 0 for command " + command_id +
+              " comment=" + command.order_check_comment +
+              " last_error=" + IntegerToString(order_check_last_error) +
+              ". No trade was executed.");
+      LogDebug("Final OrderCheck-derived status=rejected code=ORDER_CHECK_FAILED command_id=" + command_id);
+      return FailExecutionCheck(command_id,
+                                "ORDER_CHECK_FAILED",
+                                "MT5 OrderCheck did not produce a valid success or rejection retcode. No trade was executed.",
+                                command,
+                                received_at_local);
+   }
+
+   if(!IsSuccessfulOrderCheckRetcode(command.order_check_retcode))
+   {
+      LogInfo("OrderCheck rejected command " + command_id +
+              " retcode=" + IntegerToString(command.order_check_retcode) +
+              " comment=" + command.order_check_comment +
+              " last_error=" + IntegerToString(order_check_last_error) +
+              ". No trade was executed.");
+      LogDebug("Final OrderCheck-derived status=rejected code=ORDER_CHECK_REJECTED command_id=" + command_id);
+      return FailExecutionCheck(command_id,
+                                "ORDER_CHECK_REJECTED",
+                                "MT5 OrderCheck rejected the request. No trade was executed.",
+                                command,
+                                received_at_local);
+   }
+
+   LogInfo("OrderCheck passed for command " + command_id +
+           " retcode=" + IntegerToString(command.order_check_retcode) +
+           " comment=" + command.order_check_comment +
+           " last_error=" + IntegerToString(order_check_last_error) +
+           ". No trade was executed.");
+
+   accepted_code = "ORDER_CHECK_PASSED_NO_TRADE";
+   accepted_message = "Command passed validation, risk calculation, and MT5 OrderCheck. No trade was executed in Phase 6.";
+   LogDebug("Final OrderCheck-derived status=accepted code=" + accepted_code + " command_id=" + command_id);
+   return true;
 }
 
 bool CalculateRiskForCommand(const string command_id,
@@ -1895,10 +2401,15 @@ void ProcessReadyCommand(const string ready_file_name)
    if(!CalculateRiskForCommand(command_id, command, received_at_local))
       return;
 
+   string accepted_code = "";
+   string accepted_message = "";
+   if(!RunExecutionCheckForCommand(command_id, command, received_at_local, accepted_code, accepted_message))
+      return;
+
    FinalizeCommand(command_id,
                    "accepted",
-                   "RISK_CALCULATED",
-                   "Command passed validation and risk calculation. No trade was executed in Phase 5.",
+                   accepted_code,
+                   accepted_message,
                    command,
                    received_at_local,
                    PROCESSED_FOLDER,
@@ -1978,6 +2489,8 @@ string BuildStatusJson()
    json += "  \"allowed_symbols\": " + JsonString(AllowedSymbols) + ",\n";
    json += "  \"max_risk_percent\": " + JsonDouble(MaxRiskPercent, 6) + ",\n";
    json += "  \"max_volume\": " + JsonDouble(MaxVolume, 8) + ",\n";
+   json += "  \"enable_order_check\": " + (EnableOrderCheck ? "true" : "false") + ",\n";
+   json += "  \"max_deviation_points\": " + IntegerToString(MaxDeviationPoints) + ",\n";
    json += "  \"timestamp_local\": " + JsonString(LocalTimestamp()) + ",\n";
    json += "  \"heartbeat_counter\": " + IntegerToString((long)g_heartbeat_counter) + "\n";
    json += "}\n";
@@ -2008,14 +2521,16 @@ int OnInit()
       g_processed_command_cache_size = 1;
    }
 
-   LogInfo("Initializing MTChartBridgeEA phase 5.");
+   LogInfo("Initializing MTChartBridgeEA phase 6.");
    LogInfo("Command TTL enforcement=" + (EnforceCommandTtl ? "true" : "false") +
            " max_ttl_ms=" + IntegerToString(MaxCommandTtlMs) +
            " processed_cache_size=" + IntegerToString(g_processed_command_cache_size) +
            " reject_if_spread_above_points=" + IntegerToString(RejectIfSpreadAbovePoints) +
            " allowed_symbols=" + AllowedSymbols +
            " max_risk_percent=" + DoubleToString(MaxRiskPercent, 6) +
-           " max_volume=" + DoubleToString(MaxVolume, 8));
+           " max_volume=" + DoubleToString(MaxVolume, 8) +
+           " enable_order_check=" + (EnableOrderCheck ? "true" : "false") +
+           " max_deviation_points=" + IntegerToString(MaxDeviationPoints));
    LogInfo("Common folder for Chrome Extension access later: " + COMMON_FOLDER_HINT);
 
    if(!EnsureFolderStructure())
@@ -2061,6 +2576,6 @@ void OnTimer()
    if(!WriteStatusFile())
       LogLastErrorThrottled("WriteStatusFile");
 
-   // Phase 5 reads at most one local command per timer tick, calculates risk, and never trades.
+   // Phase 6 reads at most one local command per timer tick, checks execution safety, and never trades.
    ProcessOneReadyCommand();
 }
