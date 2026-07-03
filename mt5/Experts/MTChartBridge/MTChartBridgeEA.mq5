@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //| MTChartBridgeEA.mq5                                              |
-//| Phase 4: market validation, no risk, no trade.                    |
+//| Phase 5: risk engine / volume calculation, no trade.              |
 //+------------------------------------------------------------------+
 #property copyright "MTChartBridge"
 #property link      ""
@@ -16,6 +16,8 @@ input int    MaxCommandTtlMs   = 30000;
 input int    ProcessedCommandCacheSize = 200;
 input int    RejectIfSpreadAbovePoints = 0;
 input string AllowedSymbols = "";
+input double MaxRiskPercent = 2.0;
+input double MaxVolume = 0.0;
 
 #define MTCB_VERSION "0.1.0"
 
@@ -27,7 +29,7 @@ const string OUTBOX_FOLDER      = "MTChartBridge\\outbox";
 const string PROCESSED_FOLDER   = "MTChartBridge\\processed";
 const string FAILED_FOLDER      = "MTChartBridge\\failed";
 const string COMMON_FOLDER_HINT = "Terminal/Common/Files/MTChartBridge";
-const string EA_PHASE           = "phase-4-market-validation";
+const string EA_PHASE           = "phase-5-risk-engine";
 
 int      g_polling_interval_ms = 250;
 int      g_processed_command_cache_size = 200;
@@ -62,9 +64,21 @@ struct CommandData
    bool   has_source;
    bool   has_symbol;
    bool   has_side;
+   bool   has_risk_percent;
    bool   has_dry_run;
    bool   has_stop_loss;
    bool   has_market_validation_settings;
+   bool   has_equity;
+   bool   has_max_risk_percent;
+   bool   has_risk_amount;
+   bool   has_loss_per_lot;
+   bool   has_raw_volume;
+   bool   has_volume;
+   bool   has_estimated_loss;
+   bool   has_estimated_profit_at_sl;
+   bool   has_volume_constraints;
+   bool   has_max_volume;
+   bool   has_volume_normalized_down;
    bool   has_bid;
    bool   has_ask;
    bool   has_entry_price_reference;
@@ -81,6 +95,19 @@ struct CommandData
    int    digits;
    string allowed_symbols;
    int    reject_if_spread_above_points;
+   double equity;
+   double max_risk_percent;
+   double risk_amount;
+   double loss_per_lot;
+   double raw_volume;
+   double volume;
+   double estimated_loss;
+   double estimated_profit_at_sl;
+   double volume_min;
+   double volume_max;
+   double volume_step;
+   double max_volume;
+   bool   volume_normalized_down;
 };
 
 ProcessedCommandCacheEntry g_processed_command_cache[];
@@ -719,9 +746,21 @@ void ResetCommandData(CommandData &command)
    command.has_source = false;
    command.has_symbol = false;
    command.has_side = false;
+   command.has_risk_percent = false;
    command.has_dry_run = false;
    command.has_stop_loss = false;
    command.has_market_validation_settings = false;
+   command.has_equity = false;
+   command.has_max_risk_percent = false;
+   command.has_risk_amount = false;
+   command.has_loss_per_lot = false;
+   command.has_raw_volume = false;
+   command.has_volume = false;
+   command.has_estimated_loss = false;
+   command.has_estimated_profit_at_sl = false;
+   command.has_volume_constraints = false;
+   command.has_max_volume = false;
+   command.has_volume_normalized_down = false;
    command.has_bid = false;
    command.has_ask = false;
    command.has_entry_price_reference = false;
@@ -738,6 +777,19 @@ void ResetCommandData(CommandData &command)
    command.digits = 0;
    command.allowed_symbols = "";
    command.reject_if_spread_above_points = 0;
+   command.equity = 0.0;
+   command.max_risk_percent = 0.0;
+   command.risk_amount = 0.0;
+   command.loss_per_lot = 0.0;
+   command.raw_volume = 0.0;
+   command.volume = 0.0;
+   command.estimated_loss = 0.0;
+   command.estimated_profit_at_sl = 0.0;
+   command.volume_min = 0.0;
+   command.volume_max = 0.0;
+   command.volume_step = 0.0;
+   command.max_volume = 0.0;
+   command.volume_normalized_down = false;
 }
 
 string BuildResponseJson(const string command_id,
@@ -760,6 +812,8 @@ string BuildResponseJson(const string command_id,
       json += "  \"symbol\": " + JsonString(command.symbol) + ",\n";
    if(command.has_side)
       json += "  \"side\": " + JsonString(command.side) + ",\n";
+   if(command.has_risk_percent)
+      json += "  \"risk_percent\": " + JsonDouble(command.risk_percent, 6) + ",\n";
    if(command.has_dry_run)
       json += "  \"dry_run\": " + (command.dry_run ? "true" : "false") + ",\n";
    if(command.has_source)
@@ -789,6 +843,35 @@ string BuildResponseJson(const string command_id,
       json += "  \"allowed_symbols\": " + JsonString(command.allowed_symbols) + ",\n";
       json += "  \"reject_if_spread_above_points\": " + IntegerToString(command.reject_if_spread_above_points) + ",\n";
    }
+   if(command.has_equity)
+      json += "  \"equity\": " + JsonDouble(command.equity, 2) + ",\n";
+   if(command.has_max_risk_percent)
+      json += "  \"max_risk_percent\": " + JsonDouble(command.max_risk_percent, 6) + ",\n";
+   if(command.has_risk_amount)
+      json += "  \"risk_amount\": " + JsonDouble(command.risk_amount, 2) + ",\n";
+   if(command.has_loss_per_lot)
+   {
+      json += "  \"calculation_method\": \"OrderCalcProfit\",\n";
+      json += "  \"loss_per_lot\": " + JsonDouble(command.loss_per_lot, 2) + ",\n";
+   }
+   if(command.has_raw_volume)
+      json += "  \"raw_volume\": " + JsonDouble(command.raw_volume, 8) + ",\n";
+   if(command.has_volume)
+      json += "  \"volume\": " + JsonDouble(command.volume, 8) + ",\n";
+   if(command.has_estimated_loss)
+      json += "  \"estimated_loss\": " + JsonDouble(command.estimated_loss, 2) + ",\n";
+   if(command.has_estimated_profit_at_sl)
+      json += "  \"estimated_profit_at_sl\": " + JsonDouble(command.estimated_profit_at_sl, 2) + ",\n";
+   if(command.has_volume_constraints)
+   {
+      json += "  \"volume_min\": " + JsonDouble(command.volume_min, 8) + ",\n";
+      json += "  \"volume_max\": " + JsonDouble(command.volume_max, 8) + ",\n";
+      json += "  \"volume_step\": " + JsonDouble(command.volume_step, 8) + ",\n";
+   }
+   if(command.has_max_volume)
+      json += "  \"max_volume\": " + JsonDouble(command.max_volume, 8) + ",\n";
+   if(command.has_volume_normalized_down)
+      json += "  \"volume_normalized_down\": " + (command.volume_normalized_down ? "true" : "false") + ",\n";
 
    json += "  \"trace_id\": " + JsonString(BuildTraceId(command_id)) + ",\n";
    json += "  \"timestamp_local\": " + JsonString(processed_at_local) + ",\n";
@@ -960,6 +1043,33 @@ bool FailMarketValidation(const string command_id,
    return false;
 }
 
+bool RejectRiskCommand(const string command_id,
+                       const string code,
+                       const string message,
+                       CommandData &command,
+                       const string received_at_local)
+{
+   LogInfo("Risk calculation rejected command " + command_id + " code=" + code + " message=" + message);
+   return FinalizeCommand(command_id,
+                          "rejected",
+                          code,
+                          message,
+                          command,
+                          received_at_local,
+                          FAILED_FOLDER,
+                          true);
+}
+
+bool FailRiskCalculation(const string command_id,
+                         const string code,
+                         const string message,
+                         CommandData &command,
+                         const string received_at_local)
+{
+   RejectRiskCommand(command_id, code, message, command, received_at_local);
+   return false;
+}
+
 string TrimWhitespace(const string value)
 {
    int start = 0;
@@ -1016,6 +1126,236 @@ bool IsSymbolAllowedByInput(const string symbol)
 bool HasActiveTakeProfit(CommandData &command)
 {
    return command.has_take_profit && command.take_profit != 0.0;
+}
+
+double NormalizeVolumeDown(const double volume, const double volume_step)
+{
+   if(volume <= 0.0 || volume_step <= 0.0)
+      return 0.0;
+
+   const double steps = MathFloor(volume / volume_step);
+   return NormalizeDouble(steps * volume_step, 8);
+}
+
+bool CalculateRiskForCommand(const string command_id,
+                             CommandData &command,
+                             const string received_at_local)
+{
+   command.max_risk_percent = MaxRiskPercent;
+   command.has_max_risk_percent = true;
+   command.max_volume = MaxVolume;
+   command.has_max_volume = true;
+
+   ResetLastError();
+   const double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity <= 0.0)
+   {
+      LogDebug("Equity unavailable for command_id=" + command_id + " equity=" + DoubleToString(equity, 2));
+      return FailRiskCalculation(command_id,
+                                 "EQUITY_UNAVAILABLE",
+                                 "Account equity is unavailable.",
+                                 command,
+                                 received_at_local);
+   }
+
+   command.equity = equity;
+   command.has_equity = true;
+
+   if(command.risk_percent <= 0.0)
+   {
+      return FailRiskCalculation(command_id,
+                                 "INVALID_RISK_PERCENT",
+                                 "Command risk_percent must be positive.",
+                                 command,
+                                 received_at_local);
+   }
+
+   if(command.risk_percent > MaxRiskPercent)
+   {
+      LogDebug("Risk percent too high command_id=" + command_id +
+               " risk_percent=" + DoubleToString(command.risk_percent, 6) +
+               " max_risk_percent=" + DoubleToString(MaxRiskPercent, 6));
+      return FailRiskCalculation(command_id,
+                                 "RISK_PERCENT_TOO_HIGH",
+                                 "Command risk_percent exceeds MaxRiskPercent.",
+                                 command,
+                                 received_at_local);
+   }
+
+   const double risk_amount = equity * command.risk_percent / 100.0;
+   command.risk_amount = risk_amount;
+   command.has_risk_amount = true;
+
+   double profit_at_sl_per_lot = 0.0;
+   ENUM_ORDER_TYPE order_type = ORDER_TYPE_SELL;
+   if(command.side == "buy")
+      order_type = ORDER_TYPE_BUY;
+
+   ResetLastError();
+   if(!OrderCalcProfit(order_type,
+                       command.symbol,
+                       1.0,
+                       command.entry_price_reference,
+                       command.stop_loss,
+                       profit_at_sl_per_lot))
+   {
+      LogLastError("OrderCalcProfit(1.0," + command.symbol + ")");
+      return FailRiskCalculation(command_id,
+                                 "ORDER_CALC_PROFIT_FAILED",
+                                 "MT5 could not calculate hypothetical stop-loss profit for 1 lot.",
+                                 command,
+                                 received_at_local);
+   }
+
+   const double loss_per_lot = MathAbs(profit_at_sl_per_lot);
+   command.loss_per_lot = loss_per_lot;
+   command.has_loss_per_lot = true;
+
+   if(loss_per_lot <= 0.0)
+   {
+      LogDebug("Loss per lot was not positive command_id=" + command_id +
+               " profit_at_sl_per_lot=" + DoubleToString(profit_at_sl_per_lot, 2));
+      return FailRiskCalculation(command_id,
+                                 "STOP_LOSS_LOSS_NOT_POSITIVE",
+                                 "Calculated stop-loss loss per lot is not positive.",
+                                 command,
+                                 received_at_local);
+   }
+
+   const double raw_volume = risk_amount / loss_per_lot;
+   command.raw_volume = raw_volume;
+   command.has_raw_volume = true;
+
+   if(raw_volume <= 0.0)
+   {
+      return FailRiskCalculation(command_id,
+                                 "INVALID_CALCULATED_VOLUME",
+                                 "Calculated raw volume is invalid.",
+                                 command,
+                                 received_at_local);
+   }
+
+   double volume_min = 0.0;
+   double volume_max = 0.0;
+   double volume_step = 0.0;
+
+   if(!SymbolInfoDouble(command.symbol, SYMBOL_VOLUME_MIN, volume_min) ||
+      !SymbolInfoDouble(command.symbol, SYMBOL_VOLUME_MAX, volume_max) ||
+      !SymbolInfoDouble(command.symbol, SYMBOL_VOLUME_STEP, volume_step) ||
+      volume_min <= 0.0 ||
+      volume_max < volume_min ||
+      volume_step <= 0.0)
+   {
+      LogDebug("Invalid volume constraints command_id=" + command_id +
+               " volume_min=" + DoubleToString(volume_min, 8) +
+               " volume_max=" + DoubleToString(volume_max, 8) +
+               " volume_step=" + DoubleToString(volume_step, 8));
+      return FailRiskCalculation(command_id,
+                                 "SYMBOL_VOLUME_CONSTRAINTS_UNAVAILABLE",
+                                 "Symbol volume constraints are unavailable or invalid.",
+                                 command,
+                                 received_at_local);
+   }
+
+   command.volume_min = volume_min;
+   command.volume_max = volume_max;
+   command.volume_step = volume_step;
+   command.has_volume_constraints = true;
+
+   double normalized_volume = NormalizeVolumeDown(raw_volume, volume_step);
+   command.volume_normalized_down = true;
+   command.has_volume_normalized_down = true;
+
+   if(normalized_volume < volume_min)
+   {
+      LogDebug("Risk too small for min volume command_id=" + command_id +
+               " raw_volume=" + DoubleToString(raw_volume, 8) +
+               " normalized_volume=" + DoubleToString(normalized_volume, 8) +
+               " volume_min=" + DoubleToString(volume_min, 8));
+      return FailRiskCalculation(command_id,
+                                 "RISK_TOO_SMALL_FOR_MIN_VOLUME",
+                                 "Requested risk is too small for the symbol minimum volume.",
+                                 command,
+                                 received_at_local);
+   }
+
+   if(normalized_volume > volume_max)
+      normalized_volume = NormalizeVolumeDown(volume_max, volume_step);
+
+   if(MaxVolume > 0.0 && normalized_volume > MaxVolume)
+      normalized_volume = NormalizeVolumeDown(MaxVolume, volume_step);
+
+   if(normalized_volume < volume_min)
+   {
+      LogDebug("Volume cap below min volume command_id=" + command_id +
+               " normalized_volume=" + DoubleToString(normalized_volume, 8) +
+               " volume_min=" + DoubleToString(volume_min, 8) +
+               " max_volume=" + DoubleToString(MaxVolume, 8));
+      return FailRiskCalculation(command_id,
+                                 "RISK_TOO_SMALL_FOR_MIN_VOLUME",
+                                 "Requested risk or configured MaxVolume is below the symbol minimum volume.",
+                                 command,
+                                 received_at_local);
+   }
+
+   command.volume = normalized_volume;
+   command.has_volume = true;
+
+   double estimated_profit_at_sl = 0.0;
+   ResetLastError();
+   if(!OrderCalcProfit(order_type,
+                       command.symbol,
+                       normalized_volume,
+                       command.entry_price_reference,
+                       command.stop_loss,
+                       estimated_profit_at_sl))
+   {
+      LogLastError("OrderCalcProfit(" + DoubleToString(normalized_volume, 8) + "," + command.symbol + ")");
+      return FailRiskCalculation(command_id,
+                                 "ORDER_CALC_PROFIT_FAILED",
+                                 "MT5 could not calculate estimated stop-loss profit for normalized volume.",
+                                 command,
+                                 received_at_local);
+   }
+
+   command.estimated_profit_at_sl = estimated_profit_at_sl;
+   command.has_estimated_profit_at_sl = true;
+   command.estimated_loss = MathAbs(estimated_profit_at_sl);
+   command.has_estimated_loss = true;
+
+   const double tolerance = MathMax(0.01, risk_amount * 0.000001);
+   if(command.estimated_loss > risk_amount + tolerance)
+   {
+      LogDebug("Estimated loss exceeds risk command_id=" + command_id +
+               " estimated_loss=" + DoubleToString(command.estimated_loss, 2) +
+               " risk_amount=" + DoubleToString(risk_amount, 2) +
+               " tolerance=" + DoubleToString(tolerance, 6));
+      return FailRiskCalculation(command_id,
+                                 "ESTIMATED_LOSS_EXCEEDS_RISK",
+                                 "Estimated stop-loss loss exceeds requested risk.",
+                                 command,
+                                 received_at_local);
+   }
+
+   LogDebug("Risk calculation command_id=" + command_id +
+            " equity=" + DoubleToString(equity, 2) +
+            " risk_percent=" + DoubleToString(command.risk_percent, 6) +
+            " max_risk_percent=" + DoubleToString(MaxRiskPercent, 6) +
+            " risk_amount=" + DoubleToString(risk_amount, 2) +
+            " loss_per_lot=" + DoubleToString(loss_per_lot, 2) +
+            " raw_volume=" + DoubleToString(raw_volume, 8));
+   LogDebug("Volume constraints command_id=" + command_id +
+            " volume_min=" + DoubleToString(volume_min, 8) +
+            " volume_max=" + DoubleToString(volume_max, 8) +
+            " volume_step=" + DoubleToString(volume_step, 8) +
+            " max_volume=" + DoubleToString(MaxVolume, 8) +
+            " normalized_volume=" + DoubleToString(normalized_volume, 8) +
+            " estimated_loss=" + DoubleToString(command.estimated_loss, 2));
+   LogInfo("Risk calculation accepted command " + command_id +
+           " code=RISK_CALCULATED volume=" + DoubleToString(normalized_volume, 8) +
+           " estimated_loss=" + DoubleToString(command.estimated_loss, 2) +
+           ". No trade was executed.");
+   return true;
 }
 
 bool ValidateMarketForCommand(const string command_id,
@@ -1401,6 +1741,7 @@ bool ParseAndValidateCommand(const string command_json,
       RejectCommand(command_id, "INVALID_RISK_PERCENT", "Command risk_percent must be positive.", command, received_at_local);
       return false;
    }
+   command.has_risk_percent = true;
    LogDebug("Parsed risk_percent for command " + command_id + ": " + DoubleToString(command.risk_percent, 4));
 
    if(!JsonExtractDoubleNumber(command_json, "stop_loss", command.stop_loss) ||
@@ -1551,10 +1892,13 @@ void ProcessReadyCommand(const string ready_file_name)
    if(!ValidateMarketForCommand(command_id, command, received_at_local))
       return;
 
+   if(!CalculateRiskForCommand(command_id, command, received_at_local))
+      return;
+
    FinalizeCommand(command_id,
                    "accepted",
-                   "MARKET_VALIDATION_PASSED",
-                   "Command passed protocol and market validation. No trade was executed in Phase 4.",
+                   "RISK_CALCULATED",
+                   "Command passed validation and risk calculation. No trade was executed in Phase 5.",
                    command,
                    received_at_local,
                    PROCESSED_FOLDER,
@@ -1632,6 +1976,8 @@ string BuildStatusJson()
    json += "  \"processed_command_cache_size\": " + IntegerToString(g_processed_command_cache_size) + ",\n";
    json += "  \"reject_if_spread_above_points\": " + IntegerToString(RejectIfSpreadAbovePoints) + ",\n";
    json += "  \"allowed_symbols\": " + JsonString(AllowedSymbols) + ",\n";
+   json += "  \"max_risk_percent\": " + JsonDouble(MaxRiskPercent, 6) + ",\n";
+   json += "  \"max_volume\": " + JsonDouble(MaxVolume, 8) + ",\n";
    json += "  \"timestamp_local\": " + JsonString(LocalTimestamp()) + ",\n";
    json += "  \"heartbeat_counter\": " + IntegerToString((long)g_heartbeat_counter) + "\n";
    json += "}\n";
@@ -1662,12 +2008,14 @@ int OnInit()
       g_processed_command_cache_size = 1;
    }
 
-   LogInfo("Initializing MTChartBridgeEA phase 4.");
+   LogInfo("Initializing MTChartBridgeEA phase 5.");
    LogInfo("Command TTL enforcement=" + (EnforceCommandTtl ? "true" : "false") +
            " max_ttl_ms=" + IntegerToString(MaxCommandTtlMs) +
            " processed_cache_size=" + IntegerToString(g_processed_command_cache_size) +
            " reject_if_spread_above_points=" + IntegerToString(RejectIfSpreadAbovePoints) +
-           " allowed_symbols=" + AllowedSymbols);
+           " allowed_symbols=" + AllowedSymbols +
+           " max_risk_percent=" + DoubleToString(MaxRiskPercent, 6) +
+           " max_volume=" + DoubleToString(MaxVolume, 8));
    LogInfo("Common folder for Chrome Extension access later: " + COMMON_FOLDER_HINT);
 
    if(!EnsureFolderStructure())
@@ -1713,6 +2061,6 @@ void OnTimer()
    if(!WriteStatusFile())
       LogLastErrorThrottled("WriteStatusFile");
 
-   // Phase 4 reads at most one local command per timer tick, validates market state, and never trades.
+   // Phase 5 reads at most one local command per timer tick, calculates risk, and never trades.
    ProcessOneReadyCommand();
 }

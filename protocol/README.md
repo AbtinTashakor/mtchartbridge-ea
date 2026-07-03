@@ -6,10 +6,10 @@ The protocol is file based:
 
 - Commands are written by the extension.
 - Commands are read and validated by the EA.
-- Final trade volume is the EA's responsibility and must be calculated inside MT5 in a later phase.
+- Final trade volume is calculated by the EA inside MT5.
 - Responses are written by the EA.
 
-Phase 4 uses this local folder structure under `Terminal/Common/Files/MTChartBridge/`:
+Phase 5 uses this local folder structure under `Terminal/Common/Files/MTChartBridge/`:
 
 ```text
 inbox/
@@ -24,12 +24,17 @@ The EA only processes commands with a ready marker. It writes responses to `outb
 
 Accepted commands are moved to `processed/`. Invalid, missing, unreadable, expired, or duplicate commands are moved to `failed/` when possible.
 
-Phase 4 keeps Phase 3 protocol validation, command TTL checks, and session-level duplicate-command detection. After protocol validation passes, it validates live MT5 market state for the command symbol. It does not execute trades and does not calculate final trade volume yet.
+Phase 5 keeps Phase 3 protocol validation, command TTL checks, session-level duplicate-command detection, and Phase 4 live market validation. After market validation passes, it calculates risk amount and final volume inside MT5. It does not execute trades.
 
-New Phase 4 EA inputs:
+Market-validation EA inputs:
 
 - `RejectIfSpreadAbovePoints`: default `0`; values greater than `0` reject commands when current spread points are above the input.
 - `AllowedSymbols`: default empty; when set, a comma-separated symbol allowlist matched case-insensitively after trimming spaces.
+
+Risk EA inputs:
+
+- `MaxRiskPercent`: default `2.0`; rejects commands whose `risk_percent` is above this value.
+- `MaxVolume`: default `0.0`; when greater than `0`, caps calculated volume down to the largest valid `SYMBOL_VOLUME_STEP` not exceeding this value.
 
 ## Command Fields
 
@@ -54,7 +59,7 @@ Optional fields:
 
 ## Responses
 
-All responses include `type`, `id`, `status`, `code`, `message`, `ea_phase`, `trace_id`, `timestamp_local`, `received_at_local`, and `processed_at_local`. When parsed from the command, responses also include `symbol`, `side`, `dry_run`, `source`, and `comment`.
+All responses include `type`, `id`, `status`, `code`, `message`, `ea_phase`, `trace_id`, `timestamp_local`, `received_at_local`, and `processed_at_local`. When parsed from the command, responses also include `symbol`, `side`, `risk_percent`, `dry_run`, `source`, and `comment`.
 
 Market validation responses also include available market context:
 
@@ -70,22 +75,40 @@ Market validation responses also include available market context:
 - `allowed_symbols`
 - `reject_if_spread_above_points`
 
+Risk calculation responses include risk fields as they become available:
+
+- `equity`
+- `risk_percent`
+- `max_risk_percent`
+- `risk_amount`
+- `calculation_method`: `OrderCalcProfit`
+- `loss_per_lot`
+- `raw_volume`
+- `volume`
+- `estimated_loss`
+- `estimated_profit_at_sl`
+- `volume_min`
+- `volume_max`
+- `volume_step`
+- `max_volume`
+- `volume_normalized_down`
+
 Accepted commands return:
 
 ```json
 {
   "status": "accepted",
-  "code": "MARKET_VALIDATION_PASSED"
+  "code": "RISK_CALCULATED"
 }
 ```
 
 The accepted response message is:
 
 ```text
-Command passed protocol and market validation. No trade was executed in Phase 4.
+Command passed validation and risk calculation. No trade was executed in Phase 5.
 ```
 
-Phase 4 market validation can reject commands with:
+Market validation can reject commands with:
 
 - `SYMBOL_NOT_ALLOWED`
 - `SYMBOL_SELECT_FAILED`
@@ -98,6 +121,17 @@ Phase 4 market validation can reject commands with:
 - `INVALID_TAKE_PROFIT`
 - `STOP_LOSS_TOO_CLOSE`
 - `TAKE_PROFIT_TOO_CLOSE`
+
+Risk calculation can reject commands with:
+
+- `EQUITY_UNAVAILABLE`
+- `RISK_PERCENT_TOO_HIGH`
+- `ORDER_CALC_PROFIT_FAILED`
+- `STOP_LOSS_LOSS_NOT_POSITIVE`
+- `INVALID_CALCULATED_VOLUME`
+- `SYMBOL_VOLUME_CONSTRAINTS_UNAVAILABLE`
+- `RISK_TOO_SMALL_FOR_MIN_VOLUME`
+- `ESTIMATED_LOSS_EXCEEDS_RISK`
 
 Expired commands return:
 
@@ -117,4 +151,4 @@ Duplicate commands within the same EA session return:
 }
 ```
 
-See `command.example.json` and `response.example.json` for the Phase 4 message shape.
+See `command.example.json` and `response.example.json` for the Phase 5 message shape.
