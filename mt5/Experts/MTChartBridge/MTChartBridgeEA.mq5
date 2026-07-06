@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //| MTChartBridgeEA.mq5                                              |
-//| Phase 6: execution safety check / OrderCheck, no trade.           |
+//| Phase 7: live execution gate / real OrderSend.                    |
 //+------------------------------------------------------------------+
 #property copyright "MTChartBridge"
 #property link      ""
@@ -20,6 +20,9 @@ input double MaxRiskPercent = 2.0;
 input double MaxVolume = 0.0;
 input bool   EnableOrderCheck = true;
 input int    MaxDeviationPoints = 20;
+input bool   EnableLiveTrading = false;
+input bool   AllowLiveOrderSend = false;
+input string LiveTradingAcknowledgement = "";
 
 #define MTCB_VERSION "0.1.0"
 
@@ -31,7 +34,8 @@ const string OUTBOX_FOLDER      = "MTChartBridge\\outbox";
 const string PROCESSED_FOLDER   = "MTChartBridge\\processed";
 const string FAILED_FOLDER      = "MTChartBridge\\failed";
 const string COMMON_FOLDER_HINT = "Terminal/Common/Files/MTChartBridge";
-const string EA_PHASE           = "phase-6-execution-check";
+const string EA_PHASE           = "phase-7-live-execution";
+const string LIVE_TRADING_ACKNOWLEDGEMENT = "I_UNDERSTAND_THIS_CAN_OPEN_REAL_TRADES";
 
 int      g_polling_interval_ms = 250;
 int      g_processed_command_cache_size = 200;
@@ -82,8 +86,10 @@ struct CommandData
    bool   has_max_volume;
    bool   has_volume_normalized_down;
    bool   has_execution_check_settings;
+   bool   has_live_execution_settings;
    bool   has_trade_request;
    bool   has_order_check_result;
+   bool   has_order_send_result;
    bool   has_last_error_diagnostics;
    bool   has_bid;
    bool   has_ask;
@@ -116,6 +122,10 @@ struct CommandData
    bool   volume_normalized_down;
    bool   enable_order_check;
    int    max_deviation_points;
+   bool   enable_live_trading;
+   bool   allow_live_order_send;
+   bool   live_trading_acknowledgement_valid;
+   bool   order_send_attempted;
    string request_action;
    string request_type;
    string request_symbol;
@@ -136,6 +146,15 @@ struct CommandData
    double order_check_margin;
    double order_check_margin_free;
    double order_check_margin_level;
+   bool   order_send_call_success;
+   long   order_send_retcode;
+   string order_send_comment;
+   ulong  order_send_order;
+   ulong  order_send_deal;
+   double order_send_volume;
+   double order_send_price;
+   double order_send_bid;
+   double order_send_ask;
    int    last_error;
    string last_error_description;
 };
@@ -792,8 +811,10 @@ void ResetCommandData(CommandData &command)
    command.has_max_volume = false;
    command.has_volume_normalized_down = false;
    command.has_execution_check_settings = false;
+   command.has_live_execution_settings = true;
    command.has_trade_request = false;
    command.has_order_check_result = false;
+   command.has_order_send_result = false;
    command.has_last_error_diagnostics = false;
    command.has_bid = false;
    command.has_ask = false;
@@ -826,6 +847,10 @@ void ResetCommandData(CommandData &command)
    command.volume_normalized_down = false;
    command.enable_order_check = false;
    command.max_deviation_points = 0;
+   command.enable_live_trading = EnableLiveTrading;
+   command.allow_live_order_send = AllowLiveOrderSend;
+   command.live_trading_acknowledgement_valid = (LiveTradingAcknowledgement == LIVE_TRADING_ACKNOWLEDGEMENT);
+   command.order_send_attempted = false;
    command.request_action = "";
    command.request_type = "";
    command.request_symbol = "";
@@ -846,6 +871,15 @@ void ResetCommandData(CommandData &command)
    command.order_check_margin = 0.0;
    command.order_check_margin_free = 0.0;
    command.order_check_margin_level = 0.0;
+   command.order_send_call_success = false;
+   command.order_send_retcode = 0;
+   command.order_send_comment = "";
+   command.order_send_order = 0;
+   command.order_send_deal = 0;
+   command.order_send_volume = 0.0;
+   command.order_send_price = 0.0;
+   command.order_send_bid = 0.0;
+   command.order_send_ask = 0.0;
    command.last_error = 0;
    command.last_error_description = "";
 }
@@ -934,6 +968,22 @@ string BuildResponseJson(const string command_id,
    {
       json += "  \"enable_order_check\": " + (command.enable_order_check ? "true" : "false") + ",\n";
       json += "  \"max_deviation_points\": " + IntegerToString(command.max_deviation_points) + ",\n";
+   }
+   if(command.has_live_execution_settings)
+   {
+      json += "  \"enable_live_trading\": " + (command.enable_live_trading ? "true" : "false") + ",\n";
+      json += "  \"allow_live_order_send\": " + (command.allow_live_order_send ? "true" : "false") + ",\n";
+      json += "  \"live_trading_acknowledgement_valid\": " + (command.live_trading_acknowledgement_valid ? "true" : "false") + ",\n";
+      json += "  \"order_send_attempted\": " + (command.order_send_attempted ? "true" : "false") + ",\n";
+      json += "  \"order_send_call_success\": " + (command.order_send_call_success ? "true" : "false") + ",\n";
+      json += "  \"order_send_retcode\": " + IntegerToString(command.order_send_retcode) + ",\n";
+      json += "  \"order_send_comment\": " + JsonString(command.order_send_comment) + ",\n";
+      json += "  \"order_send_order\": " + IntegerToString(command.order_send_order) + ",\n";
+      json += "  \"order_send_deal\": " + IntegerToString(command.order_send_deal) + ",\n";
+      json += "  \"order_send_volume\": " + JsonDouble(command.order_send_volume, 8) + ",\n";
+      json += "  \"order_send_price\": " + JsonDouble(command.order_send_price, command.has_digits ? command.digits : 8) + ",\n";
+      json += "  \"order_send_bid\": " + JsonDouble(command.order_send_bid, command.has_digits ? command.digits : 8) + ",\n";
+      json += "  \"order_send_ask\": " + JsonDouble(command.order_send_ask, command.has_digits ? command.digits : 8) + ",\n";
    }
    if(command.has_trade_request)
    {
@@ -1455,9 +1505,148 @@ void StoreOrderCheckResult(CommandData &command,
    command.has_order_check_result = true;
 }
 
+void StoreOrderSendResult(CommandData &command,
+                          const bool order_send_call_success,
+                          MqlTradeResult &send_result)
+{
+   command.order_send_call_success = order_send_call_success;
+   command.order_send_retcode = (long)send_result.retcode;
+   command.order_send_comment = send_result.comment;
+   command.order_send_order = send_result.order;
+   command.order_send_deal = send_result.deal;
+   command.order_send_volume = send_result.volume;
+   command.order_send_price = send_result.price;
+   command.order_send_bid = send_result.bid;
+   command.order_send_ask = send_result.ask;
+   command.has_order_send_result = true;
+}
+
+bool IsSuccessfulTradeRetcode(const long retcode)
+{
+   return retcode == TRADE_RETCODE_DONE ||
+          retcode == TRADE_RETCODE_PLACED ||
+          retcode == TRADE_RETCODE_DONE_PARTIAL;
+}
+
 bool IsSuccessfulOrderCheckRetcode(const long retcode)
 {
-   return retcode == TRADE_RETCODE_DONE;
+   return IsSuccessfulTradeRetcode(retcode);
+}
+
+void RefreshLiveExecutionSettings(CommandData &command)
+{
+   command.enable_live_trading = EnableLiveTrading;
+   command.allow_live_order_send = AllowLiveOrderSend;
+   command.live_trading_acknowledgement_valid = (LiveTradingAcknowledgement == LIVE_TRADING_ACKNOWLEDGEMENT);
+   command.has_live_execution_settings = true;
+}
+
+bool ValidateLiveTradingPermissions(const string command_id,
+                                    CommandData &command,
+                                    const string received_at_local)
+{
+   const bool terminal_trade_allowed = (bool)TerminalInfoInteger(TERMINAL_TRADE_ALLOWED);
+   const bool account_trade_allowed = (bool)AccountInfoInteger(ACCOUNT_TRADE_ALLOWED);
+   const bool mql_trade_allowed = (bool)MQLInfoInteger(MQL_TRADE_ALLOWED);
+
+   LogInfo("Phase 7 live permission gate command_id=" + command_id +
+           " terminal=" + (terminal_trade_allowed ? "true" : "false") +
+           " account=" + (account_trade_allowed ? "true" : "false") +
+           " mql=" + (mql_trade_allowed ? "true" : "false"));
+
+   if(!terminal_trade_allowed || !mql_trade_allowed)
+   {
+      return FailExecutionCheck(command_id,
+                                "TERMINAL_TRADE_DISABLED",
+                                "Terminal or EA automated trading permission is disabled.",
+                                command,
+                                received_at_local);
+   }
+
+   if(!account_trade_allowed)
+   {
+      return FailExecutionCheck(command_id,
+                                "ACCOUNT_TRADE_DISABLED",
+                                "Account trading permission is disabled.",
+                                command,
+                                received_at_local);
+   }
+
+   return true;
+}
+
+bool RunOrderCheckForCommand(const string command_id,
+                             CommandData &command,
+                             MqlTradeRequest &request,
+                             const string received_at_local)
+{
+   MqlTradeCheckResult check_result;
+   ZeroMemory(check_result);
+
+   ResetLastError();
+   const bool check_call_succeeded = OrderCheck(request, check_result);
+   const int order_check_last_error = GetLastError();
+   StoreOrderCheckResult(command, check_call_succeeded, check_result);
+   StoreLastErrorDiagnostics(command, order_check_last_error);
+
+   if(command.order_check_comment == "")
+      command.order_check_comment = "OrderCheck returned retcode " + IntegerToString(command.order_check_retcode) + ".";
+
+   LogInfo("Phase 7 OrderCheck command_id=" + command_id +
+           " call_success=" + (check_call_succeeded ? "true" : "false") +
+           " retcode=" + IntegerToString(command.order_check_retcode) +
+           " comment=" + command.order_check_comment);
+   LogDebug("OrderCheck diagnostics command_id=" + command_id +
+            " last_error=" + IntegerToString(order_check_last_error));
+
+   if(!check_call_succeeded)
+   {
+      LogInfo("OrderCheck call failed for command " + command_id +
+              " retcode=" + IntegerToString(command.order_check_retcode) +
+              " comment=" + command.order_check_comment +
+              " last_error=" + IntegerToString(order_check_last_error) +
+              ". OrderSend will not be attempted.");
+      LogDebug("Final OrderCheck-derived status=rejected code=ORDER_CHECK_FAILED command_id=" + command_id);
+      return FailExecutionCheck(command_id,
+                                "ORDER_CHECK_FAILED",
+                                "MT5 OrderCheck call failed. No trade was executed.",
+                                command,
+                                received_at_local);
+   }
+
+   if(command.order_check_retcode == 0)
+   {
+      LogInfo("OrderCheck returned ambiguous retcode 0 for command " + command_id +
+              " comment=" + command.order_check_comment +
+              " last_error=" + IntegerToString(order_check_last_error) +
+              ". OrderSend will not be attempted.");
+      LogDebug("Final OrderCheck-derived status=rejected code=ORDER_CHECK_FAILED command_id=" + command_id);
+      return FailExecutionCheck(command_id,
+                                "ORDER_CHECK_FAILED",
+                                "MT5 OrderCheck did not produce a valid success or rejection retcode. No trade was executed.",
+                                command,
+                                received_at_local);
+   }
+
+   if(!IsSuccessfulOrderCheckRetcode(command.order_check_retcode))
+   {
+      LogInfo("OrderCheck rejected command " + command_id +
+              " retcode=" + IntegerToString(command.order_check_retcode) +
+              " comment=" + command.order_check_comment +
+              " last_error=" + IntegerToString(order_check_last_error) +
+              ". OrderSend will not be attempted.");
+      LogDebug("Final OrderCheck-derived status=rejected code=ORDER_CHECK_REJECTED command_id=" + command_id);
+      return FailExecutionCheck(command_id,
+                                "ORDER_CHECK_REJECTED",
+                                "MT5 OrderCheck rejected the request. No trade was executed.",
+                                command,
+                                received_at_local);
+   }
+
+   LogInfo("OrderCheck passed for command " + command_id +
+           " retcode=" + IntegerToString(command.order_check_retcode) +
+           " comment=" + command.order_check_comment);
+   return true;
 }
 
 bool BuildMarketTradeRequest(const string command_id,
@@ -1503,7 +1692,7 @@ bool BuildMarketTradeRequest(const string command_id,
 
    StoreTradeRequestPreview(command, request);
 
-   LogDebug("Phase 6 request command_id=" + command_id +
+   LogDebug("Phase 7 request command_id=" + command_id +
             " type=" + command.request_type +
             " price=" + DoubleToString(command.request_price, command.has_digits ? command.digits : 8) +
             " volume=" + DoubleToString(command.request_volume, 8) +
@@ -1519,30 +1708,24 @@ bool RunExecutionCheckForCommand(const string command_id,
                                  string &accepted_code,
                                  string &accepted_message)
 {
-   LogInfo("Phase 6 execution check started for command " + command_id + ".");
+   LogInfo("Phase 7 live execution gate started for command " + command_id + ".");
 
    command.enable_order_check = EnableOrderCheck;
    command.max_deviation_points = MaxDeviationPoints;
    command.has_execution_check_settings = true;
+   RefreshLiveExecutionSettings(command);
 
-   LogDebug("Phase 6 settings command_id=" + command_id +
-            " dry_run=" + (command.dry_run ? "true" : "false") +
-            " enable_order_check=" + (EnableOrderCheck ? "true" : "false") +
-            " max_deviation_points=" + IntegerToString(MaxDeviationPoints));
-
-   if(!command.dry_run)
-   {
-      LogInfo("Phase 6 dry_run gate rejected command " + command_id + ".");
-      return FailExecutionCheck(command_id,
-                                "DRY_RUN_REQUIRED",
-                                "Phase 6 only supports dry_run=true. No trade was executed.",
-                                command,
-                                received_at_local);
-   }
-   LogDebug("Phase 6 dry_run gate passed for command " + command_id + ".");
+   LogInfo("Phase 7 command gates command_id=" + command_id +
+           " dry_run=" + (command.dry_run ? "true" : "false") +
+           " enable_live_trading=" + (EnableLiveTrading ? "true" : "false") +
+           " allow_live_order_send=" + (AllowLiveOrderSend ? "true" : "false") +
+           " acknowledgement_valid=" + (command.live_trading_acknowledgement_valid ? "true" : "false") +
+           " enable_order_check=" + (EnableOrderCheck ? "true" : "false") +
+           " max_deviation_points=" + IntegerToString(MaxDeviationPoints));
 
    if(MaxDeviationPoints < 0)
    {
+      LogInfo("Phase 7 MaxDeviationPoints gate rejected command " + command_id + ".");
       return FailExecutionCheck(command_id,
                                 "INVALID_DEVIATION_POINTS",
                                 "MaxDeviationPoints must be greater than or equal to 0.",
@@ -1550,96 +1733,143 @@ bool RunExecutionCheckForCommand(const string command_id,
                                 received_at_local);
    }
 
+   if(!command.dry_run)
+   {
+      if(!EnableLiveTrading)
+      {
+         LogInfo("Phase 7 live gate rejected command " + command_id + " because EnableLiveTrading=false.");
+         return FailExecutionCheck(command_id,
+                                   "LIVE_TRADING_DISABLED",
+                                   "Live trading is disabled by the EnableLiveTrading EA input.",
+                                   command,
+                                   received_at_local);
+      }
+
+      if(!AllowLiveOrderSend)
+      {
+         LogInfo("Phase 7 live gate rejected command " + command_id + " because AllowLiveOrderSend=false.");
+         return FailExecutionCheck(command_id,
+                                   "LIVE_ORDER_SEND_DISABLED",
+                                   "Live OrderSend is disabled by the AllowLiveOrderSend EA input.",
+                                   command,
+                                   received_at_local);
+      }
+
+      if(!command.live_trading_acknowledgement_valid)
+      {
+         LogInfo("Phase 7 live gate rejected command " + command_id + " because acknowledgement is missing or invalid.");
+         return FailExecutionCheck(command_id,
+                                   "LIVE_ACKNOWLEDGEMENT_REQUIRED",
+                                   "LiveTradingAcknowledgement must exactly match the required safety acknowledgement.",
+                                   command,
+                                   received_at_local);
+      }
+
+      if(!EnableOrderCheck)
+      {
+         LogInfo("Phase 7 live gate rejected command " + command_id + " because EnableOrderCheck=false.");
+         return FailExecutionCheck(command_id,
+                                   "ORDER_CHECK_REQUIRED_FOR_LIVE",
+                                   "Live execution requires EnableOrderCheck=true before OrderSend can be attempted.",
+                                   command,
+                                   received_at_local);
+      }
+
+      if(!ValidateLiveTradingPermissions(command_id, command, received_at_local))
+         return false;
+   }
+
    MqlTradeRequest request;
    if(!BuildMarketTradeRequest(command_id, command, request, received_at_local))
       return false;
 
-   LogInfo("Phase 6 prepared " + command.request_type +
+   LogInfo("Phase 7 prepared " + command.request_type +
            " request for command " + command_id +
            " volume=" + DoubleToString(command.request_volume, 8) +
            " price=" + DoubleToString(command.request_price, command.has_digits ? command.digits : 8) +
            " filling=" + command.request_type_filling +
-           ". No trade was executed.");
+           " dry_run=" + (command.dry_run ? "true" : "false") + ".");
 
-   if(!EnableOrderCheck)
+   if(command.dry_run && !EnableOrderCheck)
    {
-      LogInfo("OrderCheck disabled by input for command " + command_id + ". Returning execution preview only.");
+      LogInfo("Dry-run command " + command_id + " will not call OrderSend. OrderCheck disabled; returning request preview only.");
       accepted_code = "EXECUTION_PREVIEW_READY_NO_TRADE";
-      accepted_message = "Command passed validation and risk calculation. Execution request preview was built. No trade was executed in Phase 6.";
+      accepted_message = "Command passed validation and risk calculation. Execution request preview was built. No trade was executed in Phase 7.";
       return true;
    }
 
-   MqlTradeCheckResult check_result;
-   ZeroMemory(check_result);
+   if(!RunOrderCheckForCommand(command_id, command, request, received_at_local))
+      return false;
 
+   if(command.dry_run)
+   {
+      LogInfo("Dry-run command " + command_id + " passed OrderCheck. OrderSend will not be attempted.");
+      accepted_code = "ORDER_CHECK_PASSED_NO_TRADE";
+      accepted_message = "Command passed validation, risk calculation, and MT5 OrderCheck. No trade was executed in Phase 7.";
+      LogDebug("Final OrderCheck-derived status=accepted code=" + accepted_code + " command_id=" + command_id);
+      return true;
+   }
+
+   LogInfo("Phase 7 all live gates passed for command " + command_id + ". OrderSend will be attempted once.");
+
+   MqlTradeResult send_result;
+   ZeroMemory(send_result);
+
+   command.order_send_attempted = true;
    ResetLastError();
-   const bool check_call_succeeded = OrderCheck(request, check_result);
-   const int order_check_last_error = GetLastError();
-   StoreOrderCheckResult(command, check_call_succeeded, check_result);
-   StoreLastErrorDiagnostics(command, order_check_last_error);
+   const bool order_send_call_success = OrderSend(request, send_result);
+   const int order_send_last_error = GetLastError();
+   StoreOrderSendResult(command, order_send_call_success, send_result);
+   StoreLastErrorDiagnostics(command, order_send_last_error);
 
-   if(command.order_check_comment == "")
-      command.order_check_comment = "OrderCheck returned retcode " + IntegerToString(command.order_check_retcode) + ".";
+   if(command.order_send_comment == "")
+      command.order_send_comment = "OrderSend returned retcode " + IntegerToString(command.order_send_retcode) + ".";
 
-   LogDebug("OrderCheck call command_id=" + command_id +
-            " call_result=" + (check_call_succeeded ? "true" : "false") +
-            " retcode=" + IntegerToString(command.order_check_retcode) +
-            " comment=" + command.order_check_comment +
-            " last_error=" + IntegerToString(order_check_last_error));
+   LogInfo("Phase 7 OrderSend command_id=" + command_id +
+           " call_success=" + (order_send_call_success ? "true" : "false") +
+           " retcode=" + IntegerToString(command.order_send_retcode) +
+           " comment=" + command.order_send_comment +
+           " order=" + IntegerToString(command.order_send_order) +
+           " deal=" + IntegerToString(command.order_send_deal));
+   LogDebug("OrderSend diagnostics command_id=" + command_id +
+            " volume=" + DoubleToString(command.order_send_volume, 8) +
+            " price=" + DoubleToString(command.order_send_price, command.has_digits ? command.digits : 8) +
+            " bid=" + DoubleToString(command.order_send_bid, command.has_digits ? command.digits : 8) +
+            " ask=" + DoubleToString(command.order_send_ask, command.has_digits ? command.digits : 8) +
+            " last_error=" + IntegerToString(order_send_last_error));
 
-   if(!check_call_succeeded)
+   if(!order_send_call_success || command.order_send_retcode == 0)
    {
-      LogInfo("OrderCheck call failed for command " + command_id +
-              " retcode=" + IntegerToString(command.order_check_retcode) +
-              " comment=" + command.order_check_comment +
-              " last_error=" + IntegerToString(order_check_last_error) +
-              ". No trade was executed.");
-      LogDebug("Final OrderCheck-derived status=rejected code=ORDER_CHECK_FAILED command_id=" + command_id);
+      RememberCommandResult(command_id, "rejected", "ORDER_SEND_FAILED");
+      LogInfo("OrderSend failed for command " + command_id +
+              " retcode=" + IntegerToString(command.order_send_retcode) +
+              " comment=" + command.order_send_comment +
+              " last_error=" + IntegerToString(order_send_last_error) + ".");
       return FailExecutionCheck(command_id,
-                                "ORDER_CHECK_FAILED",
-                                "MT5 OrderCheck call failed. No trade was executed.",
+                                "ORDER_SEND_FAILED",
+                                "MT5 OrderSend call failed or returned an ambiguous retcode.",
                                 command,
                                 received_at_local);
    }
 
-   if(command.order_check_retcode == 0)
+   if(!IsSuccessfulTradeRetcode(command.order_send_retcode))
    {
-      LogInfo("OrderCheck returned ambiguous retcode 0 for command " + command_id +
-              " comment=" + command.order_check_comment +
-              " last_error=" + IntegerToString(order_check_last_error) +
-              ". No trade was executed.");
-      LogDebug("Final OrderCheck-derived status=rejected code=ORDER_CHECK_FAILED command_id=" + command_id);
+      RememberCommandResult(command_id, "rejected", "ORDER_SEND_REJECTED");
+      LogInfo("OrderSend rejected command " + command_id +
+              " retcode=" + IntegerToString(command.order_send_retcode) +
+              " comment=" + command.order_send_comment +
+              " last_error=" + IntegerToString(order_send_last_error) + ".");
       return FailExecutionCheck(command_id,
-                                "ORDER_CHECK_FAILED",
-                                "MT5 OrderCheck did not produce a valid success or rejection retcode. No trade was executed.",
+                                "ORDER_SEND_REJECTED",
+                                "MT5 OrderSend rejected the live order request.",
                                 command,
                                 received_at_local);
    }
 
-   if(!IsSuccessfulOrderCheckRetcode(command.order_check_retcode))
-   {
-      LogInfo("OrderCheck rejected command " + command_id +
-              " retcode=" + IntegerToString(command.order_check_retcode) +
-              " comment=" + command.order_check_comment +
-              " last_error=" + IntegerToString(order_check_last_error) +
-              ". No trade was executed.");
-      LogDebug("Final OrderCheck-derived status=rejected code=ORDER_CHECK_REJECTED command_id=" + command_id);
-      return FailExecutionCheck(command_id,
-                                "ORDER_CHECK_REJECTED",
-                                "MT5 OrderCheck rejected the request. No trade was executed.",
-                                command,
-                                received_at_local);
-   }
-
-   LogInfo("OrderCheck passed for command " + command_id +
-           " retcode=" + IntegerToString(command.order_check_retcode) +
-           " comment=" + command.order_check_comment +
-           " last_error=" + IntegerToString(order_check_last_error) +
-           ". No trade was executed.");
-
-   accepted_code = "ORDER_CHECK_PASSED_NO_TRADE";
-   accepted_message = "Command passed validation, risk calculation, and MT5 OrderCheck. No trade was executed in Phase 6.";
-   LogDebug("Final OrderCheck-derived status=accepted code=" + accepted_code + " command_id=" + command_id);
+   accepted_code = "LIVE_ORDER_SEND_ACCEPTED";
+   accepted_message = "Live order request was sent by MT5 OrderSend.";
+   RememberCommandResult(command_id, "accepted", accepted_code);
+   LogInfo("Phase 7 final status=accepted code=" + accepted_code + " command_id=" + command_id + ".");
    return true;
 }
 
@@ -1859,8 +2089,7 @@ bool CalculateRiskForCommand(const string command_id,
             " estimated_loss=" + DoubleToString(command.estimated_loss, 2));
    LogInfo("Risk calculation accepted command " + command_id +
            " code=RISK_CALCULATED volume=" + DoubleToString(normalized_volume, 8) +
-           " estimated_loss=" + DoubleToString(command.estimated_loss, 2) +
-           ". No trade was executed.");
+           " estimated_loss=" + DoubleToString(command.estimated_loss, 2) + ".");
    return true;
 }
 
@@ -2120,7 +2349,7 @@ bool ValidateMarketForCommand(const string command_id,
       LogDebug("Stop level validation skipped or not required command_id=" + command_id);
    }
 
-   LogInfo("Market validation accepted command " + command_id + ". No trade was executed.");
+   LogInfo("Market validation accepted command " + command_id + ".");
    return true;
 }
 
@@ -2491,6 +2720,9 @@ string BuildStatusJson()
    json += "  \"max_volume\": " + JsonDouble(MaxVolume, 8) + ",\n";
    json += "  \"enable_order_check\": " + (EnableOrderCheck ? "true" : "false") + ",\n";
    json += "  \"max_deviation_points\": " + IntegerToString(MaxDeviationPoints) + ",\n";
+   json += "  \"enable_live_trading\": " + (EnableLiveTrading ? "true" : "false") + ",\n";
+   json += "  \"allow_live_order_send\": " + (AllowLiveOrderSend ? "true" : "false") + ",\n";
+   json += "  \"live_trading_acknowledgement_valid\": " + ((LiveTradingAcknowledgement == LIVE_TRADING_ACKNOWLEDGEMENT) ? "true" : "false") + ",\n";
    json += "  \"timestamp_local\": " + JsonString(LocalTimestamp()) + ",\n";
    json += "  \"heartbeat_counter\": " + IntegerToString((long)g_heartbeat_counter) + "\n";
    json += "}\n";
@@ -2521,7 +2753,7 @@ int OnInit()
       g_processed_command_cache_size = 1;
    }
 
-   LogInfo("Initializing MTChartBridgeEA phase 6.");
+   LogInfo("Initializing MTChartBridgeEA phase 7.");
    LogInfo("Command TTL enforcement=" + (EnforceCommandTtl ? "true" : "false") +
            " max_ttl_ms=" + IntegerToString(MaxCommandTtlMs) +
            " processed_cache_size=" + IntegerToString(g_processed_command_cache_size) +
@@ -2530,7 +2762,10 @@ int OnInit()
            " max_risk_percent=" + DoubleToString(MaxRiskPercent, 6) +
            " max_volume=" + DoubleToString(MaxVolume, 8) +
            " enable_order_check=" + (EnableOrderCheck ? "true" : "false") +
-           " max_deviation_points=" + IntegerToString(MaxDeviationPoints));
+           " max_deviation_points=" + IntegerToString(MaxDeviationPoints) +
+           " enable_live_trading=" + (EnableLiveTrading ? "true" : "false") +
+           " allow_live_order_send=" + (AllowLiveOrderSend ? "true" : "false") +
+           " live_acknowledgement_valid=" + ((LiveTradingAcknowledgement == LIVE_TRADING_ACKNOWLEDGEMENT) ? "true" : "false"));
    LogInfo("Common folder for Chrome Extension access later: " + COMMON_FOLDER_HINT);
 
    if(!EnsureFolderStructure())
@@ -2576,6 +2811,6 @@ void OnTimer()
    if(!WriteStatusFile())
       LogLastErrorThrottled("WriteStatusFile");
 
-   // Phase 6 reads at most one local command per timer tick, checks execution safety, and never trades.
+   // Phase 7 reads at most one local command per timer tick and only sends live orders after all gates pass.
    ProcessOneReadyCommand();
 }

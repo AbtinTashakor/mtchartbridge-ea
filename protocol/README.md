@@ -8,9 +8,9 @@ The protocol is file based:
 - Commands are read and validated by the EA.
 - Final trade volume is calculated by the EA inside MT5.
 - Responses are written by the EA.
-- No live order is sent in Phase 6.
+- Phase 7 can send a live order only after every explicit live execution gate passes.
 
-Phase 6 uses this local folder structure under `Terminal/Common/Files/MTChartBridge/`:
+Phase 7 uses this local folder structure under `Terminal/Common/Files/MTChartBridge/`:
 
 ```text
 inbox/
@@ -25,7 +25,11 @@ The EA only processes commands with a ready marker. It writes responses to `outb
 
 Accepted commands are moved to `processed/`. Invalid, missing, unreadable, expired, or duplicate commands are moved to `failed/` when possible.
 
-Phase 6 keeps Phase 3 protocol validation, command TTL checks, session-level duplicate-command detection, Phase 4 live market validation, and Phase 5 risk calculation. After risk calculation passes, it requires `dry_run=true`, builds an `MqlTradeRequest` preview, and optionally runs `OrderCheck`. It does not call `OrderSend` and does not execute trades.
+Phase 7 keeps Phase 3 protocol validation, command TTL checks, session-level duplicate-command detection, Phase 4 live market validation, Phase 5 risk calculation, and Phase 6 request building/OrderCheck behavior.
+
+When `dry_run=true`, the EA builds a request preview and optionally runs `OrderCheck`, but never calls `OrderSend`.
+
+When `dry_run=false`, the command is treated as a live execution request. The EA requires all live gates, requires `OrderCheck` to return `true` with a known success retcode, and only then calls raw `OrderSend` once. Duplicate protection remains session-level only in Phase 7.
 
 Market-validation EA inputs:
 
@@ -41,6 +45,12 @@ Execution-check EA inputs:
 
 - `EnableOrderCheck`: default `true`; when enabled, the EA runs `OrderCheck` against the built request. When disabled, the EA returns a request preview without `order_check_*` fields.
 - `MaxDeviationPoints`: default `20`; applied to the no-trade request preview. Negative values reject with `INVALID_DEVIATION_POINTS`.
+
+Live execution EA inputs:
+
+- `EnableLiveTrading`: default `false`; must be `true` for `dry_run=false`.
+- `AllowLiveOrderSend`: default `false`; must be `true` for `dry_run=false`.
+- `LiveTradingAcknowledgement`: default empty; must exactly equal `I_UNDERSTAND_THIS_CAN_OPEN_REAL_TRADES` for `dry_run=false`.
 
 ## Command Fields
 
@@ -129,9 +139,27 @@ When `EnableOrderCheck=true` and `OrderCheck` is reached, responses also include
 - `last_error`
 - `last_error_description`
 
-`ORDER_CHECK_PASSED_NO_TRADE` requires `OrderCheck` to return `true` and `order_check_retcode` to equal `TRADE_RETCODE_DONE`. `ORDER_CHECK_REJECTED` is only used when `OrderCheck` returns `true` with a meaningful non-zero non-success trade retcode. If `OrderCheck` returns `false`, or if the check result retcode remains `0` or unavailable, the EA returns `ORDER_CHECK_FAILED` with diagnostics instead of treating the result as a server rejection.
+Phase 7 live fields include:
 
-Responses do not include final live execution identifiers such as order, deal, ticket, position, execution price, or fill price fields.
+- `enable_live_trading`
+- `allow_live_order_send`
+- `live_trading_acknowledgement_valid`
+- `order_send_attempted`
+- `order_send_call_success`
+- `order_send_retcode`
+- `order_send_comment`
+- `order_send_order`
+- `order_send_deal`
+- `order_send_volume`
+- `order_send_price`
+- `order_send_bid`
+- `order_send_ask`
+
+`order_send_attempted` is always `false` for `dry_run=true`, live-gate rejections, and OrderCheck failures/rejections. It is only `true` on the actual live `OrderSend` path.
+
+`ORDER_CHECK_PASSED_NO_TRADE` requires `OrderCheck` to return `true` and `order_check_retcode` to be a known success retcode: `TRADE_RETCODE_DONE`, `TRADE_RETCODE_PLACED`, or `TRADE_RETCODE_DONE_PARTIAL`. `ORDER_CHECK_REJECTED` is only used when `OrderCheck` returns `true` with a meaningful non-zero non-success trade retcode. If `OrderCheck` returns `false`, or if the check result retcode remains `0` or unavailable, the EA returns `ORDER_CHECK_FAILED` with diagnostics instead of treating the result as a server rejection.
+
+Live `OrderSend` success uses the same known success retcodes. If `OrderSend` returns `false`, or if `order_send_retcode` remains `0`, the EA returns `ORDER_SEND_FAILED`. If `OrderSend` returns `true` with a non-zero non-success retcode, the EA returns `ORDER_SEND_REJECTED`.
 
 Accepted commands return:
 
@@ -145,10 +173,19 @@ Accepted commands return:
 The accepted response message is:
 
 ```text
-Command passed validation, risk calculation, and MT5 OrderCheck. No trade was executed in Phase 6.
+Command passed validation, risk calculation, and MT5 OrderCheck. No trade was executed in Phase 7.
 ```
 
 When `EnableOrderCheck=false`, accepted commands return `EXECUTION_PREVIEW_READY_NO_TRADE` and omit `order_check_*` fields.
+
+Accepted live commands return:
+
+```json
+{
+  "status": "accepted",
+  "code": "LIVE_ORDER_SEND_ACCEPTED"
+}
+```
 
 Market validation can reject commands with:
 
@@ -177,12 +214,20 @@ Risk calculation can reject commands with:
 
 Execution checking can reject commands with:
 
-- `DRY_RUN_REQUIRED`
 - `INVALID_DEVIATION_POINTS`
 - `ORDER_REQUEST_BUILD_FAILED`
 - `ORDER_FILLING_MODE_UNAVAILABLE`
 - `ORDER_CHECK_FAILED`
 - `ORDER_CHECK_REJECTED`
+
+Live execution can reject commands with:
+
+- `LIVE_TRADING_DISABLED`
+- `LIVE_ORDER_SEND_DISABLED`
+- `LIVE_ACKNOWLEDGEMENT_REQUIRED`
+- `ORDER_CHECK_REQUIRED_FOR_LIVE`
+- `ORDER_SEND_FAILED`
+- `ORDER_SEND_REJECTED`
 
 Expired commands return:
 
@@ -202,9 +247,10 @@ Duplicate commands within the same EA session return:
 }
 ```
 
-Phase 6 accepted codes:
+Phase 7 accepted codes:
 
 - `ORDER_CHECK_PASSED_NO_TRADE`
 - `EXECUTION_PREVIEW_READY_NO_TRADE`
+- `LIVE_ORDER_SEND_ACCEPTED`
 
-See `command.example.json` and `response.example.json` for the Phase 6 message shape.
+See `command.example.json` and `response.example.json` for the Phase 7 message shape.
