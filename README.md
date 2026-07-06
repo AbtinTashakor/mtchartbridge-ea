@@ -12,9 +12,11 @@ Chrome Extension <-> Local Shared Folder <-> MT5 Expert Advisor
 
 The Chrome Extension writes command files into a user-selected local folder. The MT5 Expert Advisor reads those local files, validates commands, calculates risk-based volume inside MT5, runs an execution safety check, and writes response files back to the same local workflow.
 
-Current status: **Phase 7 Live Execution Gate / Real OrderSend**.
+Current status: **Phase 8 Persistent Idempotency + Execution Audit Log**.
 
-Phase 7 is the first phase that can open a real trade. Live execution is disabled by default and requires `dry_run=false`, `EnableLiveTrading=true`, `AllowLiveOrderSend=true`, an exact `LiveTradingAcknowledgement`, `EnableOrderCheck=true`, successful MT5 trading permission checks, and an unambiguous successful `OrderCheck` before the EA calls raw `OrderSend` once.
+Phase 8 keeps the Phase 7 live execution gate and adds persistent command state plus an append-only audit log. A command id that has already been claimed or finalized under `state/commands/` is blocked before market validation, risk calculation, `OrderCheck`, or `OrderSend`, including after an EA or MT5 restart.
+
+Phase 7 was the first phase that can open a real trade. Live execution is disabled by default and requires `dry_run=false`, `EnableLiveTrading=true`, `AllowLiveOrderSend=true`, an exact `LiveTradingAcknowledgement`, `EnableOrderCheck=true`, successful MT5 trading permission checks, and an unambiguous successful `OrderCheck` before the EA calls raw `OrderSend` once.
 
 Dry-run commands remain no-trade previews. When `dry_run=true`, the EA never calls `OrderSend`.
 
@@ -33,6 +35,8 @@ samples/
 - No final trade volume is accepted from the extension.
 - Final trade volume is calculated inside MT5 from `risk_percent`, account equity, current Bid/Ask reference price, stop loss, and broker volume constraints.
 - Phase 7 can call raw `OrderSend` only after every live gate passes. It does not import `CTrade`.
+- Phase 8 writes `state/commands/<command_id>.state.json` before a command reaches trade paths. Before live execution it updates that state to `order_send_pending`, so a restart cannot send the same command id again.
+- Phase 8 appends lifecycle events to `audit/events.jsonl` when `EnableAuditLog=true`.
 - `dry_run=true` never calls `OrderSend`.
 - No generated `.ex5` files are committed.
 - No MT5 runtime folders or Common/Files runtime data are committed.

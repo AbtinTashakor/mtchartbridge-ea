@@ -9,14 +9,22 @@ The protocol is file based:
 - Final trade volume is calculated by the EA inside MT5.
 - Responses are written by the EA.
 - Phase 7 can send a live order only after every explicit live execution gate passes.
+- Phase 8 persistently claims command ids and writes an append-only audit log.
 
-Phase 7 uses this local folder structure under `Terminal/Common/Files/MTChartBridge/`:
+Phase 8 uses this local folder structure under `Terminal/Common/Files/MTChartBridge/`:
 
 ```text
+.mtchartbridge-folder
+status.json
 inbox/
+processing/
 outbox/
 processed/
 failed/
+logs/
+state/
+  commands/
+audit/
 ```
 
 The extension writes command payloads to `inbox/<command_id>.command.json.tmp`, then creates `inbox/<command_id>.command.ready`.
@@ -25,11 +33,11 @@ The EA only processes commands with a ready marker. It writes responses to `outb
 
 Accepted commands are moved to `processed/`. Invalid, missing, unreadable, expired, or duplicate commands are moved to `failed/` when possible.
 
-Phase 7 keeps Phase 3 protocol validation, command TTL checks, session-level duplicate-command detection, Phase 4 live market validation, Phase 5 risk calculation, and Phase 6 request building/OrderCheck behavior.
+Phase 8 keeps Phase 3 protocol validation, command TTL checks, session-level duplicate-command detection, Phase 4 live market validation, Phase 5 risk calculation, and Phase 6 request building/OrderCheck behavior. Persistent idempotency is authoritative when enabled.
 
 When `dry_run=true`, the EA builds a request preview and optionally runs `OrderCheck`, but never calls `OrderSend`.
 
-When `dry_run=false`, the command is treated as a live execution request. The EA requires all live gates, requires `OrderCheck` to return `true` with a known success retcode, and only then calls raw `OrderSend` once. Duplicate protection remains session-level only in Phase 7.
+When `dry_run=false`, the command is treated as a live execution request. The EA requires all live gates, requires `OrderCheck` to return `true` with a known success retcode, and only then calls raw `OrderSend` once. Phase 8 writes `state="order_send_pending"` before that call so a restart cannot send the same command id again.
 
 Market-validation EA inputs:
 
@@ -51,6 +59,13 @@ Live execution EA inputs:
 - `EnableLiveTrading`: default `false`; must be `true` for `dry_run=false`.
 - `AllowLiveOrderSend`: default `false`; must be `true` for `dry_run=false`.
 - `LiveTradingAcknowledgement`: default empty; must exactly equal `I_UNDERSTAND_THIS_CAN_OPEN_REAL_TRADES` for `dry_run=false`.
+
+Persistent idempotency and audit EA inputs:
+
+- `EnablePersistentIdempotency`: default `true`; writes `state/commands/<command_id>.state.json` and blocks any previously claimed, final, or `order_send_pending` command id before trade paths.
+- `EnableAuditLog`: default `true`; appends lifecycle events to `audit/events.jsonl`.
+
+When `EnablePersistentIdempotency=false`, status.json includes `persistent_idempotency_enabled=false` and a warning that duplicate protection is session-level only. When `EnableAuditLog=false`, status.json includes `audit_log_enabled=false` and audit writes are skipped.
 
 ## Command Fields
 
@@ -76,6 +91,18 @@ Optional fields:
 ## Responses
 
 All responses include `type`, `id`, `status`, `code`, `message`, `ea_phase`, `trace_id`, `timestamp_local`, `received_at_local`, and `processed_at_local`. When parsed from the command, responses also include `symbol`, `side`, `risk_percent`, `dry_run`, `source`, and `comment`.
+
+Phase 8 responses also include:
+
+- `persistent_idempotency_enabled`
+- `audit_log_enabled`
+- `persistent_duplicate` when a persistent state file blocked processing
+- `command_state_path` when persistent state is involved
+- `previous_state`, `previous_status`, `previous_code`, and `previous_order_send_attempted` when available for duplicates
+- `command_claimed_at_local`
+- `command_finalized_at_local`
+- `audit_write_failed`
+- `state_write_failed`
 
 Market validation responses also include available market context:
 
@@ -247,10 +274,39 @@ Duplicate commands within the same EA session return:
 }
 ```
 
-Phase 7 accepted codes:
+Persistent duplicates return one of:
+
+```json
+{
+  "status": "duplicate",
+  "code": "PERSISTENT_DUPLICATE_COMMAND"
+}
+```
+
+```json
+{
+  "status": "rejected",
+  "code": "COMMAND_ALREADY_CLAIMED"
+}
+```
+
+```json
+{
+  "status": "rejected",
+  "code": "COMMAND_EXECUTION_STATE_INDETERMINATE"
+}
+```
+
+Persistent state and audit failures fail safe with:
+
+- `COMMAND_STATE_WRITE_FAILED`
+- `COMMAND_STATE_READ_FAILED`
+- `AUDIT_WRITE_FAILED`
+
+Phase 8 accepted codes:
 
 - `ORDER_CHECK_PASSED_NO_TRADE`
 - `EXECUTION_PREVIEW_READY_NO_TRADE`
 - `LIVE_ORDER_SEND_ACCEPTED`
 
-See `command.example.json` and `response.example.json` for the Phase 7 message shape.
+See `command.example.json` and `response.example.json` for the Phase 8 message shape.

@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //| MTChartBridgeEA.mq5                                              |
-//| Phase 7: live execution gate / real OrderSend.                    |
+//| Phase 8: persistent idempotency + execution audit log.            |
 //+------------------------------------------------------------------+
 #property copyright "MTChartBridge"
 #property link      ""
@@ -23,6 +23,8 @@ input int    MaxDeviationPoints = 20;
 input bool   EnableLiveTrading = false;
 input bool   AllowLiveOrderSend = false;
 input string LiveTradingAcknowledgement = "";
+input bool   EnablePersistentIdempotency = true;
+input bool   EnableAuditLog = true;
 
 #define MTCB_VERSION "0.1.0"
 
@@ -33,8 +35,12 @@ const string INBOX_FOLDER       = "MTChartBridge\\inbox";
 const string OUTBOX_FOLDER      = "MTChartBridge\\outbox";
 const string PROCESSED_FOLDER   = "MTChartBridge\\processed";
 const string FAILED_FOLDER      = "MTChartBridge\\failed";
+const string STATE_FOLDER       = "MTChartBridge\\state";
+const string COMMAND_STATE_FOLDER = "MTChartBridge\\state\\commands";
+const string AUDIT_FOLDER       = "MTChartBridge\\audit";
+const string AUDIT_EVENTS_PATH  = "MTChartBridge\\audit\\events.jsonl";
 const string COMMON_FOLDER_HINT = "Terminal/Common/Files/MTChartBridge";
-const string EA_PHASE           = "phase-7-live-execution";
+const string EA_PHASE           = "phase-8-persistent-idempotency";
 const string LIVE_TRADING_ACKNOWLEDGEMENT = "I_UNDERSTAND_THIS_CAN_OPEN_REAL_TRADES";
 
 int      g_polling_interval_ms = 250;
@@ -126,6 +132,19 @@ struct CommandData
    bool   allow_live_order_send;
    bool   live_trading_acknowledgement_valid;
    bool   order_send_attempted;
+   bool   persistent_idempotency_enabled;
+   bool   audit_log_enabled;
+   bool   persistent_duplicate;
+   bool   audit_write_failed;
+   bool   state_write_failed;
+   bool   has_command_state_path;
+   bool   has_previous_state;
+   bool   has_previous_status;
+   bool   has_previous_code;
+   bool   has_previous_order_send_attempted;
+   bool   has_command_claimed_at_local;
+   bool   has_command_finalized_at_local;
+   bool   has_trace_id;
    string request_action;
    string request_type;
    string request_symbol;
@@ -157,11 +176,27 @@ struct CommandData
    double order_send_ask;
    int    last_error;
    string last_error_description;
+   string command_state_path;
+   string previous_state;
+   string previous_status;
+   string previous_code;
+   bool   previous_order_send_attempted;
+   string command_claimed_at_local;
+   string command_finalized_at_local;
+   string trace_id;
 };
 
 ProcessedCommandCacheEntry g_processed_command_cache[];
 
 bool CommonFolderAcceptsFile(const string folder_path, int &probe_error);
+bool FinalizeCommand(const string command_id,
+                     const string status,
+                     const string code,
+                     const string message,
+                     CommandData &command,
+                     const string received_at_local,
+                     const string archive_folder,
+                     const bool remember_result);
 
 //+------------------------------------------------------------------+
 //| Logging helpers.                                                  |
@@ -624,7 +659,10 @@ bool EnsureFolderStructure()
       "outbox",
       "processed",
       "failed",
-      "logs"
+      "logs",
+      "state",
+      "state\\commands",
+      "audit"
    };
 
    for(int i = 0; i < ArraySize(folders); i++)
@@ -657,6 +695,34 @@ bool WriteCommonTextFile(const string file_path, const string content)
       return false;
    }
 
+   const uint written = FileWriteString(handle, content);
+   if(written == 0 && StringLen(content) > 0)
+   {
+      FileClose(handle);
+      LogLastError("FileWriteString(" + file_path + ")");
+      return false;
+   }
+
+   FileFlush(handle);
+   FileClose(handle);
+   return true;
+}
+
+bool AppendCommonTextFile(const string file_path, const string content)
+{
+   ResetLastError();
+
+   if(!FileIsExist(file_path, FILE_COMMON))
+      return WriteCommonTextFile(file_path, content);
+
+   const int handle = FileOpen(file_path, FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   if(handle == INVALID_HANDLE)
+   {
+      LogLastError("FileOpen(" + file_path + ")");
+      return false;
+   }
+
+   FileSeek(handle, 0, SEEK_END);
    const uint written = FileWriteString(handle, content);
    if(written == 0 && StringLen(content) > 0)
    {
@@ -851,6 +917,19 @@ void ResetCommandData(CommandData &command)
    command.allow_live_order_send = AllowLiveOrderSend;
    command.live_trading_acknowledgement_valid = (LiveTradingAcknowledgement == LIVE_TRADING_ACKNOWLEDGEMENT);
    command.order_send_attempted = false;
+   command.persistent_idempotency_enabled = EnablePersistentIdempotency;
+   command.audit_log_enabled = EnableAuditLog;
+   command.persistent_duplicate = false;
+   command.audit_write_failed = false;
+   command.state_write_failed = false;
+   command.has_command_state_path = false;
+   command.has_previous_state = false;
+   command.has_previous_status = false;
+   command.has_previous_code = false;
+   command.has_previous_order_send_attempted = false;
+   command.has_command_claimed_at_local = false;
+   command.has_command_finalized_at_local = false;
+   command.has_trace_id = false;
    command.request_action = "";
    command.request_type = "";
    command.request_symbol = "";
@@ -882,6 +961,14 @@ void ResetCommandData(CommandData &command)
    command.order_send_ask = 0.0;
    command.last_error = 0;
    command.last_error_description = "";
+   command.command_state_path = "";
+   command.previous_state = "";
+   command.previous_status = "";
+   command.previous_code = "";
+   command.previous_order_send_attempted = false;
+   command.command_claimed_at_local = "";
+   command.command_finalized_at_local = "";
+   command.trace_id = "";
 }
 
 string BuildResponseJson(const string command_id,
@@ -899,6 +986,29 @@ string BuildResponseJson(const string command_id,
    json += "  \"code\": " + JsonString(code) + ",\n";
    json += "  \"message\": " + JsonString(message) + ",\n";
    json += "  \"ea_phase\": " + JsonString(EA_PHASE) + ",\n";
+   json += "  \"persistent_idempotency_enabled\": " + (command.persistent_idempotency_enabled ? "true" : "false") + ",\n";
+   json += "  \"audit_log_enabled\": " + (command.audit_log_enabled ? "true" : "false") + ",\n";
+
+   if(command.persistent_duplicate)
+      json += "  \"persistent_duplicate\": true,\n";
+   if(command.has_command_state_path)
+      json += "  \"command_state_path\": " + JsonString(command.command_state_path) + ",\n";
+   if(command.has_previous_state)
+      json += "  \"previous_state\": " + JsonString(command.previous_state) + ",\n";
+   if(command.has_previous_status)
+      json += "  \"previous_status\": " + JsonString(command.previous_status) + ",\n";
+   if(command.has_previous_code)
+      json += "  \"previous_code\": " + JsonString(command.previous_code) + ",\n";
+   if(command.has_previous_order_send_attempted)
+      json += "  \"previous_order_send_attempted\": " + (command.previous_order_send_attempted ? "true" : "false") + ",\n";
+   if(command.has_command_claimed_at_local)
+      json += "  \"command_claimed_at_local\": " + JsonString(command.command_claimed_at_local) + ",\n";
+   if(command.has_command_finalized_at_local)
+      json += "  \"command_finalized_at_local\": " + JsonString(command.command_finalized_at_local) + ",\n";
+   if(command.audit_write_failed)
+      json += "  \"audit_write_failed\": true,\n";
+   if(command.state_write_failed)
+      json += "  \"state_write_failed\": true,\n";
 
    if(command.has_symbol)
       json += "  \"symbol\": " + JsonString(command.symbol) + ",\n";
@@ -1017,7 +1127,13 @@ string BuildResponseJson(const string command_id,
       json += "  \"last_error_description\": " + JsonString(command.last_error_description) + ",\n";
    }
 
-   json += "  \"trace_id\": " + JsonString(BuildTraceId(command_id)) + ",\n";
+   if(!command.has_trace_id)
+   {
+      command.trace_id = BuildTraceId(command_id);
+      command.has_trace_id = true;
+   }
+
+   json += "  \"trace_id\": " + JsonString(command.trace_id) + ",\n";
    json += "  \"timestamp_local\": " + JsonString(processed_at_local) + ",\n";
    json += "  \"received_at_local\": " + JsonString(received_at_local) + ",\n";
    json += "  \"processed_at_local\": " + JsonString(processed_at_local) + "\n";
@@ -1080,6 +1196,376 @@ void RememberCommandResult(const string command_id, const string status, const s
    g_processed_command_cache[max_cached - 1].code = code;
 }
 
+bool IsSafeCommandId(const string command_id)
+{
+   const int length = StringLen(command_id);
+   if(length <= 0 || length > 128)
+      return false;
+
+   for(int i = 0; i < length; i++)
+   {
+      const ushort ch = StringGetCharacter(command_id, i);
+      const bool digit = (ch >= 48 && ch <= 57);
+      const bool upper = (ch >= 65 && ch <= 90);
+      const bool lower = (ch >= 97 && ch <= 122);
+      const bool dash = (ch == 45);
+      const bool underscore = (ch == 95);
+
+      if(!digit && !upper && !lower && !dash && !underscore)
+         return false;
+   }
+
+   return true;
+}
+
+string CommandStatePath(const string command_id)
+{
+   return COMMAND_STATE_FOLDER + "\\" + command_id + ".state.json";
+}
+
+void EnsureCommandTraceId(const string command_id, CommandData &command)
+{
+   if(command.has_trace_id)
+      return;
+
+   command.trace_id = BuildTraceId(command_id);
+   command.has_trace_id = true;
+}
+
+void PopulateCommandMetadataForClaim(const string command_json, CommandData &command)
+{
+   string text_value = "";
+   bool bool_value = false;
+
+   if(JsonExtractString(command_json, "symbol", text_value))
+   {
+      command.symbol = text_value;
+      command.has_symbol = true;
+   }
+
+   if(JsonExtractString(command_json, "side", text_value))
+   {
+      command.side = text_value;
+      command.has_side = true;
+   }
+
+   if(JsonExtractString(command_json, "source", text_value))
+   {
+      command.source = text_value;
+      command.has_source = true;
+   }
+
+   if(JsonExtractBool(command_json, "dry_run", bool_value))
+   {
+      command.dry_run = bool_value;
+      command.has_dry_run = true;
+   }
+}
+
+void PopulatePreviousStateFields(CommandData &command,
+                                 const string state_json,
+                                 const string state_path)
+{
+   command.persistent_duplicate = true;
+   command.command_state_path = state_path;
+   command.has_command_state_path = true;
+
+   if(JsonExtractString(state_json, "state", command.previous_state))
+      command.has_previous_state = true;
+   if(JsonExtractString(state_json, "final_status", command.previous_status))
+      command.has_previous_status = true;
+   if(JsonExtractString(state_json, "final_code", command.previous_code))
+      command.has_previous_code = true;
+   if(JsonExtractBool(state_json, "order_send_attempted", command.previous_order_send_attempted))
+      command.has_previous_order_send_attempted = true;
+   if(JsonExtractString(state_json, "claimed_at_local", command.command_claimed_at_local))
+      command.has_command_claimed_at_local = true;
+}
+
+string AuditEventJson(const string event_type,
+                      const string command_id,
+                      CommandData &command,
+                      const string status,
+                      const string code,
+                      const string archive_destination)
+{
+   EnsureCommandTraceId(command_id, command);
+
+   string json = "{";
+   json += "\"event_type\":" + JsonString(event_type);
+   json += ",\"id\":" + JsonString(command_id);
+   json += ",\"timestamp_local\":" + JsonString(LocalTimestamp());
+   json += ",\"ea_phase\":" + JsonString(EA_PHASE);
+   if(status != "")
+      json += ",\"status\":" + JsonString(status);
+   if(code != "")
+      json += ",\"code\":" + JsonString(code);
+   if(command.has_symbol)
+      json += ",\"symbol\":" + JsonString(command.symbol);
+   if(command.has_side)
+      json += ",\"side\":" + JsonString(command.side);
+   if(command.has_dry_run)
+      json += ",\"dry_run\":" + (command.dry_run ? "true" : "false");
+   if(command.has_source)
+      json += ",\"source\":" + JsonString(command.source);
+   if(command.has_trace_id)
+      json += ",\"trace_id\":" + JsonString(command.trace_id);
+   if(archive_destination != "")
+      json += ",\"archive_destination\":" + JsonString(archive_destination);
+   if(command.has_live_execution_settings)
+      json += ",\"order_send_attempted\":" + (command.order_send_attempted ? "true" : "false");
+   if(command.has_order_send_result)
+   {
+      json += ",\"order_send_retcode\":" + IntegerToString(command.order_send_retcode);
+      json += ",\"order_send_order\":" + IntegerToString(command.order_send_order);
+      json += ",\"order_send_deal\":" + IntegerToString(command.order_send_deal);
+   }
+   json += "}";
+   return json;
+}
+
+bool AppendAuditEvent(const string event_type,
+                      const string command_id,
+                      CommandData &command,
+                      const string status = "",
+                      const string code = "",
+                      const string archive_destination = "")
+{
+   if(!EnableAuditLog)
+      return true;
+
+   const string line = AuditEventJson(event_type, command_id, command, status, code, archive_destination) + "\n";
+   if(AppendCommonTextFile(AUDIT_EVENTS_PATH, line))
+      return true;
+
+   command.audit_write_failed = true;
+   LogInfo("AUDIT_WRITE_FAILED event_type=" + event_type + " command_id=" + command_id);
+   return false;
+}
+
+string CommandStateJson(const string command_id,
+                        const string state,
+                        const string final_status,
+                        const string final_code,
+                        const string final_message,
+                        CommandData &command,
+                        const string finalized_at_local,
+                        const string archive_destination)
+{
+   EnsureCommandTraceId(command_id, command);
+
+   string json = "{\n";
+   json += "  \"type\": \"command_state\",\n";
+   json += "  \"id\": " + JsonString(command_id) + ",\n";
+   json += "  \"state\": " + JsonString(state) + ",\n";
+   if(final_status != "")
+      json += "  \"final_status\": " + JsonString(final_status) + ",\n";
+   if(final_code != "")
+      json += "  \"final_code\": " + JsonString(final_code) + ",\n";
+   if(final_message != "")
+      json += "  \"final_message\": " + JsonString(final_message) + ",\n";
+   json += "  \"ea_phase\": " + JsonString(EA_PHASE) + ",\n";
+   if(command.has_command_claimed_at_local)
+      json += "  \"claimed_at_local\": " + JsonString(command.command_claimed_at_local) + ",\n";
+   if(finalized_at_local != "")
+      json += "  \"finalized_at_local\": " + JsonString(finalized_at_local) + ",\n";
+   if(command.has_symbol)
+      json += "  \"symbol\": " + JsonString(command.symbol) + ",\n";
+   if(command.has_side)
+      json += "  \"side\": " + JsonString(command.side) + ",\n";
+   if(command.has_dry_run)
+      json += "  \"dry_run\": " + (command.dry_run ? "true" : "false") + ",\n";
+   if(command.has_source)
+      json += "  \"source\": " + JsonString(command.source) + ",\n";
+   if(command.has_trace_id)
+      json += "  \"trace_id\": " + JsonString(command.trace_id) + ",\n";
+   json += "  \"persistent_duplicate\": " + (command.persistent_duplicate ? "true" : "false") + ",\n";
+   if(command.has_bid)
+      json += "  \"bid\": " + JsonDouble(command.bid, command.has_digits ? command.digits : 8) + ",\n";
+   if(command.has_ask)
+      json += "  \"ask\": " + JsonDouble(command.ask, command.has_digits ? command.digits : 8) + ",\n";
+   if(command.has_entry_price_reference)
+      json += "  \"entry_price_reference\": " + JsonDouble(command.entry_price_reference, command.has_digits ? command.digits : 8) + ",\n";
+   if(command.has_spread_points)
+      json += "  \"spread_points\": " + IntegerToString(command.spread_points) + ",\n";
+   if(command.has_equity)
+      json += "  \"equity\": " + JsonDouble(command.equity, 2) + ",\n";
+   if(command.has_risk_percent)
+      json += "  \"risk_percent\": " + JsonDouble(command.risk_percent, 6) + ",\n";
+   if(command.has_risk_amount)
+      json += "  \"risk_amount\": " + JsonDouble(command.risk_amount, 2) + ",\n";
+   if(command.has_volume)
+      json += "  \"volume\": " + JsonDouble(command.volume, 8) + ",\n";
+   if(command.has_estimated_loss)
+      json += "  \"estimated_loss\": " + JsonDouble(command.estimated_loss, 2) + ",\n";
+   json += "  \"enable_live_trading\": " + (command.enable_live_trading ? "true" : "false") + ",\n";
+   json += "  \"allow_live_order_send\": " + (command.allow_live_order_send ? "true" : "false") + ",\n";
+   json += "  \"live_trading_acknowledgement_valid\": " + (command.live_trading_acknowledgement_valid ? "true" : "false") + ",\n";
+   if(command.has_order_check_result)
+   {
+      json += "  \"order_check_call_success\": " + (command.order_check_call_success ? "true" : "false") + ",\n";
+      json += "  \"order_check_retcode\": " + IntegerToString(command.order_check_retcode) + ",\n";
+      json += "  \"order_check_comment\": " + JsonString(command.order_check_comment) + ",\n";
+   }
+   const bool state_order_send_attempted = command.order_send_attempted || state == "order_send_pending";
+   json += "  \"order_send_attempted\": " + (state_order_send_attempted ? "true" : "false") + ",\n";
+   if(state == "order_send_pending")
+      json += "  \"order_send_attempted_at_local\": " + JsonString(LocalTimestamp()) + ",\n";
+   if(command.has_order_send_result)
+   {
+      json += "  \"order_send_call_success\": " + (command.order_send_call_success ? "true" : "false") + ",\n";
+      json += "  \"order_send_retcode\": " + IntegerToString(command.order_send_retcode) + ",\n";
+      json += "  \"order_send_comment\": " + JsonString(command.order_send_comment) + ",\n";
+      json += "  \"order_send_order\": " + IntegerToString(command.order_send_order) + ",\n";
+      json += "  \"order_send_deal\": " + IntegerToString(command.order_send_deal) + ",\n";
+   }
+   if(archive_destination != "")
+      json += "  \"archive_destination\": " + JsonString(archive_destination) + ",\n";
+   json += "  \"updated_at_local\": " + JsonString(LocalTimestamp()) + "\n";
+   json += "}\n";
+   return json;
+}
+
+bool WriteCommandState(const string command_id,
+                       const string state,
+                       const string final_status,
+                       const string final_code,
+                       const string final_message,
+                       CommandData &command,
+                       const string finalized_at_local,
+                       const string archive_destination)
+{
+   if(!EnablePersistentIdempotency)
+      return true;
+
+   const string state_path = CommandStatePath(command_id);
+   command.command_state_path = state_path;
+   command.has_command_state_path = true;
+
+   const string state_json = CommandStateJson(command_id,
+                                             state,
+                                             final_status,
+                                             final_code,
+                                             final_message,
+                                             command,
+                                             finalized_at_local,
+                                             archive_destination);
+   if(WriteCommonTextFile(state_path, state_json))
+      return true;
+
+   command.state_write_failed = true;
+   AppendAuditEvent("state_write_failed", command_id, command, "rejected", "COMMAND_STATE_WRITE_FAILED", archive_destination);
+   LogInfo("COMMAND_STATE_WRITE_FAILED command_id=" + command_id + " state_path=" + state_path);
+   return false;
+}
+
+bool ClaimPersistentCommand(const string command_id,
+                            CommandData &command,
+                            const string received_at_local)
+{
+   if(!EnablePersistentIdempotency)
+      return true;
+
+   const string state_path = CommandStatePath(command_id);
+   command.command_state_path = state_path;
+   command.has_command_state_path = true;
+
+   if(FileIsExist(state_path, FILE_COMMON))
+   {
+      string state_json = "";
+      if(!ReadCommonTextFile(state_path, state_json))
+      {
+         command.state_write_failed = true;
+         FinalizeCommand(command_id,
+                         "rejected",
+                         "COMMAND_STATE_READ_FAILED",
+                         "Command state could not be read safely. No action was taken.",
+                         command,
+                         received_at_local,
+                         FAILED_FOLDER,
+                         true);
+         return false;
+      }
+
+      PopulatePreviousStateFields(command, state_json, state_path);
+      AppendAuditEvent("persistent_duplicate_detected", command_id, command, "", "", FAILED_FOLDER);
+
+      if(command.previous_state == "order_send_pending")
+      {
+         command.previous_order_send_attempted = true;
+         command.has_previous_order_send_attempted = true;
+         FinalizeCommand(command_id,
+                         "rejected",
+                         "COMMAND_EXECUTION_STATE_INDETERMINATE",
+                         "Command had a previous pending live execution state. No action was taken to avoid duplicate execution.",
+                         command,
+                         received_at_local,
+                         FAILED_FOLDER,
+                         false);
+         return false;
+      }
+
+      if(command.previous_state == "claimed" || command.previous_state == "")
+      {
+         command.previous_state = "claimed";
+         command.has_previous_state = true;
+         command.previous_order_send_attempted = false;
+         command.has_previous_order_send_attempted = true;
+         FinalizeCommand(command_id,
+                         "rejected",
+                         "COMMAND_ALREADY_CLAIMED",
+                         "Command id was already claimed previously and has no final state. No action was taken to avoid duplicate execution.",
+                         command,
+                         received_at_local,
+                         FAILED_FOLDER,
+                         false);
+         return false;
+      }
+
+      FinalizeCommand(command_id,
+                      "duplicate",
+                      "PERSISTENT_DUPLICATE_COMMAND",
+                      "Command id was already processed or claimed by this EA runtime state. No action was taken.",
+                      command,
+                      received_at_local,
+                      FAILED_FOLDER,
+                      false);
+      return false;
+   }
+
+   command.command_claimed_at_local = received_at_local;
+   command.has_command_claimed_at_local = true;
+   command.order_send_attempted = false;
+
+   if(!WriteCommandState(command_id, "claimed", "", "", "", command, "", ""))
+   {
+      FinalizeCommand(command_id,
+                      "rejected",
+                      "COMMAND_STATE_WRITE_FAILED",
+                      "Command state could not be written safely. No action was taken.",
+                      command,
+                      received_at_local,
+                      FAILED_FOLDER,
+                      true);
+      return false;
+   }
+
+   if(!AppendAuditEvent("command_claimed", command_id, command, "", "", ""))
+   {
+      FinalizeCommand(command_id,
+                      "rejected",
+                      "AUDIT_WRITE_FAILED",
+                      "Audit log could not be written safely. No action was taken.",
+                      command,
+                      received_at_local,
+                      FAILED_FOLDER,
+                      true);
+      return false;
+   }
+
+   return true;
+}
+
 bool ReadyFileToCommandId(const string ready_file_name, string &command_id)
 {
    const string suffix = ".command.ready";
@@ -1093,7 +1579,7 @@ bool ReadyFileToCommandId(const string ready_file_name, string &command_id)
       return false;
 
    command_id = StringSubstr(ready_file_name, 0, name_length - suffix_length);
-   return command_id != "";
+   return IsSafeCommandId(command_id);
 }
 
 bool FinalizeCommand(const string command_id,
@@ -1105,17 +1591,52 @@ bool FinalizeCommand(const string command_id,
                      const string archive_folder,
                      const bool remember_result)
 {
+   string final_status = status;
+   string final_code = code;
+   string final_message = message;
    string final_archive_folder = archive_folder;
-   if(status == "accepted")
+   if(final_status == "accepted")
       final_archive_folder = PROCESSED_FOLDER;
-   else if(status == "rejected" || status == "duplicate")
+   else if(final_status == "rejected" || final_status == "duplicate")
       final_archive_folder = FAILED_FOLDER;
 
    const string processed_at_local = LocalTimestamp();
+   command.command_finalized_at_local = processed_at_local;
+   command.has_command_finalized_at_local = true;
+
+   if(EnablePersistentIdempotency &&
+      !command.persistent_duplicate &&
+      final_code != "COMMAND_STATE_WRITE_FAILED" &&
+      final_code != "COMMAND_STATE_READ_FAILED")
+   {
+      if(!WriteCommandState(command_id,
+                            "final",
+                            final_status,
+                            final_code,
+                            final_message,
+                            command,
+                            processed_at_local,
+                            final_archive_folder))
+      {
+         if(!command.order_send_attempted)
+         {
+            final_status = "rejected";
+            final_code = "COMMAND_STATE_WRITE_FAILED";
+            final_message = "Command state could not be finalized safely. No action was taken.";
+            final_archive_folder = FAILED_FOLDER;
+         }
+      }
+   }
+
+   if(final_status == "accepted")
+      AppendAuditEvent("command_accepted", command_id, command, final_status, final_code, final_archive_folder);
+   else if(final_status == "rejected")
+      AppendAuditEvent("command_rejected", command_id, command, final_status, final_code, final_archive_folder);
+
    const string response_json = BuildResponseJson(command_id,
-                                                  status,
-                                                  code,
-                                                  message,
+                                                  final_status,
+                                                  final_code,
+                                                  final_message,
                                                   command,
                                                   received_at_local,
                                                   processed_at_local);
@@ -1126,19 +1647,25 @@ bool FinalizeCommand(const string command_id,
       return false;
    }
 
-   LogDebug("Final response status=" + status +
-            " code=" + code +
+   if(!AppendAuditEvent("response_written", command_id, command, final_status, final_code, final_archive_folder))
+      LogInfo("AUDIT_WRITE_FAILED after response write for command: " + command_id);
+
+   LogDebug("Final response status=" + final_status +
+            " code=" + final_code +
             " command_id=" + command_id +
             " archive_destination=" + final_archive_folder);
 
    if(remember_result)
-      RememberCommandResult(command_id, status, code);
+      RememberCommandResult(command_id, final_status, final_code);
 
    if(!ArchiveCommandFiles(command_id, final_archive_folder))
    {
       LogInfo("ARCHIVE_FAILED for command: " + command_id + " destination=" + final_archive_folder);
       return false;
    }
+
+   if(!AppendAuditEvent("command_archived", command_id, command, final_status, final_code, final_archive_folder))
+      LogInfo("AUDIT_WRITE_FAILED after archive for command: " + command_id);
 
    return true;
 }
@@ -1580,6 +2107,15 @@ bool RunOrderCheckForCommand(const string command_id,
                              MqlTradeRequest &request,
                              const string received_at_local)
 {
+   if(!AppendAuditEvent("order_check_started", command_id, command, "", "", ""))
+   {
+      return FailExecutionCheck(command_id,
+                                "AUDIT_WRITE_FAILED",
+                                "Audit log could not be written safely before OrderCheck. No action was taken.",
+                                command,
+                                received_at_local);
+   }
+
    MqlTradeCheckResult check_result;
    ZeroMemory(check_result);
 
@@ -1598,6 +2134,15 @@ bool RunOrderCheckForCommand(const string command_id,
            " comment=" + command.order_check_comment);
    LogDebug("OrderCheck diagnostics command_id=" + command_id +
             " last_error=" + IntegerToString(order_check_last_error));
+
+   if(!AppendAuditEvent("order_check_finished", command_id, command, "", "", ""))
+   {
+      return FailExecutionCheck(command_id,
+                                "AUDIT_WRITE_FAILED",
+                                "Audit log could not be written safely after OrderCheck. No action was taken.",
+                                command,
+                                received_at_local);
+   }
 
    if(!check_call_succeeded)
    {
@@ -1816,6 +2361,26 @@ bool RunExecutionCheckForCommand(const string command_id,
    ZeroMemory(send_result);
 
    command.order_send_attempted = true;
+   if(!WriteCommandState(command_id, "order_send_pending", "", "", "", command, "", ""))
+   {
+      command.order_send_attempted = false;
+      return FailExecutionCheck(command_id,
+                                "COMMAND_STATE_WRITE_FAILED",
+                                "Command state could not be marked order_send_pending safely. No trade was executed.",
+                                command,
+                                received_at_local);
+   }
+
+   if(!AppendAuditEvent("order_send_pending", command_id, command, "", "", ""))
+   {
+      command.order_send_attempted = false;
+      return FailExecutionCheck(command_id,
+                                "AUDIT_WRITE_FAILED",
+                                "Audit log could not be written safely before OrderSend. No trade was executed.",
+                                command,
+                                received_at_local);
+   }
+
    ResetLastError();
    const bool order_send_call_success = OrderSend(request, send_result);
    const int order_send_last_error = GetLastError();
@@ -1837,6 +2402,9 @@ bool RunExecutionCheckForCommand(const string command_id,
             " bid=" + DoubleToString(command.order_send_bid, command.has_digits ? command.digits : 8) +
             " ask=" + DoubleToString(command.order_send_ask, command.has_digits ? command.digits : 8) +
             " last_error=" + IntegerToString(order_send_last_error));
+
+   if(!AppendAuditEvent("order_send_finished", command_id, command, "", "", ""))
+      LogInfo("AUDIT_WRITE_FAILED after OrderSend for command: " + command_id);
 
    if(!order_send_call_success || command.order_send_retcode == 0)
    {
@@ -2568,6 +3136,10 @@ void ProcessDuplicateCommand(const string command_id, const string received_at_l
 
    CommandData command;
    ResetCommandData(command);
+   command.previous_status = previous.status;
+   command.previous_code = previous.code;
+   command.has_previous_status = (previous.status != "");
+   command.has_previous_code = (previous.code != "");
 
    LogInfo("Duplicate command detected: " + command_id + " previous_status=" + previous.status + " previous_code=" + previous.code);
    FinalizeCommand(command_id,
@@ -2593,15 +3165,22 @@ void ProcessReadyCommand(const string ready_file_name)
 
    LogInfo("Command ready file detected: " + INBOX_FOLDER + "\\" + ready_file_name);
 
-   if(IsCommandRemembered(command_id))
-   {
-      ProcessDuplicateCommand(command_id, received_at_local);
-      return;
-   }
-
    const string command_path = INBOX_FOLDER + "\\" + command_id + ".command.json.tmp";
    CommandData command;
    ResetCommandData(command);
+
+   if(!AppendAuditEvent("command_detected", command_id, command, "", "", ""))
+   {
+      FinalizeCommand(command_id,
+                      "rejected",
+                      "AUDIT_WRITE_FAILED",
+                      "Audit log could not be written safely. No action was taken.",
+                      command,
+                      received_at_local,
+                      FAILED_FOLDER,
+                      true);
+      return;
+   }
 
    if(!FileIsExist(command_path, FILE_COMMON))
    {
@@ -2620,6 +3199,30 @@ void ProcessReadyCommand(const string ready_file_name)
 
    LogInfo("Command file read: " + command_path);
    LogDebug("Command parsed for protocol validation: " + command_id);
+
+   string payload_id = "";
+   if(!JsonExtractString(command_json, "id", payload_id) || payload_id == "")
+   {
+      RejectCommand(command_id, "MISSING_REQUIRED_FIELD", "Command id must be a non-empty string.", command, received_at_local);
+      return;
+   }
+
+   if(payload_id != command_id)
+   {
+      RejectCommand(command_id, "ID_MISMATCH", "Command id does not match command filename.", command, received_at_local);
+      return;
+   }
+
+   PopulateCommandMetadataForClaim(command_json, command);
+
+   if(!ClaimPersistentCommand(command_id, command, received_at_local))
+      return;
+
+   if(IsCommandRemembered(command_id))
+   {
+      ProcessDuplicateCommand(command_id, received_at_local);
+      return;
+   }
 
    if(!ParseAndValidateCommand(command_json, command_id, command, received_at_local))
       return;
@@ -2723,6 +3326,12 @@ string BuildStatusJson()
    json += "  \"enable_live_trading\": " + (EnableLiveTrading ? "true" : "false") + ",\n";
    json += "  \"allow_live_order_send\": " + (AllowLiveOrderSend ? "true" : "false") + ",\n";
    json += "  \"live_trading_acknowledgement_valid\": " + ((LiveTradingAcknowledgement == LIVE_TRADING_ACKNOWLEDGEMENT) ? "true" : "false") + ",\n";
+   json += "  \"persistent_idempotency_enabled\": " + (EnablePersistentIdempotency ? "true" : "false") + ",\n";
+   json += "  \"audit_log_enabled\": " + (EnableAuditLog ? "true" : "false") + ",\n";
+   json += "  \"state_folder\": " + JsonString(STATE_FOLDER) + ",\n";
+   json += "  \"audit_folder\": " + JsonString(AUDIT_FOLDER) + ",\n";
+   if(!EnablePersistentIdempotency)
+      json += "  \"persistent_idempotency_warning\": \"Persistent idempotency is disabled. Duplicate protection is session-level only.\",\n";
    json += "  \"timestamp_local\": " + JsonString(LocalTimestamp()) + ",\n";
    json += "  \"heartbeat_counter\": " + IntegerToString((long)g_heartbeat_counter) + "\n";
    json += "}\n";
@@ -2753,7 +3362,7 @@ int OnInit()
       g_processed_command_cache_size = 1;
    }
 
-   LogInfo("Initializing MTChartBridgeEA phase 7.");
+   LogInfo("Initializing MTChartBridgeEA phase 8.");
    LogInfo("Command TTL enforcement=" + (EnforceCommandTtl ? "true" : "false") +
            " max_ttl_ms=" + IntegerToString(MaxCommandTtlMs) +
            " processed_cache_size=" + IntegerToString(g_processed_command_cache_size) +
@@ -2765,7 +3374,9 @@ int OnInit()
            " max_deviation_points=" + IntegerToString(MaxDeviationPoints) +
            " enable_live_trading=" + (EnableLiveTrading ? "true" : "false") +
            " allow_live_order_send=" + (AllowLiveOrderSend ? "true" : "false") +
-           " live_acknowledgement_valid=" + ((LiveTradingAcknowledgement == LIVE_TRADING_ACKNOWLEDGEMENT) ? "true" : "false"));
+           " live_acknowledgement_valid=" + ((LiveTradingAcknowledgement == LIVE_TRADING_ACKNOWLEDGEMENT) ? "true" : "false") +
+           " persistent_idempotency_enabled=" + (EnablePersistentIdempotency ? "true" : "false") +
+           " audit_log_enabled=" + (EnableAuditLog ? "true" : "false"));
    LogInfo("Common folder for Chrome Extension access later: " + COMMON_FOLDER_HINT);
 
    if(!EnsureFolderStructure())
@@ -2811,6 +3422,6 @@ void OnTimer()
    if(!WriteStatusFile())
       LogLastErrorThrottled("WriteStatusFile");
 
-   // Phase 7 reads at most one local command per timer tick and only sends live orders after all gates pass.
+   // Phase 8 reads at most one local command per timer tick and blocks previously claimed IDs before trade paths.
    ProcessOneReadyCommand();
 }
